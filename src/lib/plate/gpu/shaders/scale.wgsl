@@ -1,0 +1,23 @@
+// scale.wgsl
+// Vector operation: x = alpha * x
+//
+// In-place scaling of a vector.
+
+struct Params {
+    alpha: f32,        // Scalar multiplier
+    n: u32,            // Vector length
+    _pad1: u32,
+    _pad2: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> x: array<f32>;
+@group(0) @binding(1) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < params.n) {
+        x[i] = params.alpha * x[i];
+    }
+}
+
