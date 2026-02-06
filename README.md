@@ -1,6 +1,6 @@
 # 🏆 WebGPU Plate Solver Challenge
 
-> **First to achieve 60k DOF solve in under 20ms wins $500!**
+> **First to achieve 60k DOF solve in under 20ms wins $1,000!**
 
 ## The Challenge
 
@@ -27,7 +27,8 @@ With 1000 iterations, that's **3000 round trips** to the GPU. Each readback cost
 
 ## Prize Structure
 
-- **$5000** - First person to achieve <20ms for 60k DOF
+- **$1,000** - First person to achieve <20ms for 60k DOF
+- **$3,000** - First person to achieve <10ms for 60k DOF
 - Results must be reproducible and validated against CPU reference
 
 ## Browser Requirements
