@@ -27,7 +27,7 @@ With 1000 iterations, that's **3000 round trips** to the GPU. Each readback cost
 
 ## Prize Structure
 
-- **$500** - First person to achieve <20ms for 60k DOF
+- **$5000** - First person to achieve <20ms for 60k DOF
 - Results must be reproducible and validated against CPU reference
 
 ## Browser Requirements
