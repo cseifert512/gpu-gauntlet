@@ -40,8 +40,8 @@ export { createPipelines, GPUDispatcher, createParamsBuffer } from './pipelines'
 export type { PlatePipelines } from './pipelines';
 
 // Main GPU solver
-export { solveGPU, clearPipelineCache } from './solver';
-export type { GPUSolverOptions, GPUSolveResult } from './solver';
+export { solveGPU, clearPipelineCache, prepareGPUSolver, destroyGPUSolverContext } from './solver';
+export type { GPUSolverOptions, GPUSolveResult, GPUSolverContext } from './solver';
 
 // CPU fallback (for direct use or testing)
 export { solveCPU, compareSolutions } from './fallback';

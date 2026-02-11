@@ -26,6 +26,11 @@ import {
   axpyBufSource,
   updatePBufSource,
   copyScalarSource,
+  dotSingleSource,
+  computeAlphaPairSource,
+  spmvCSRSource,
+  applyKPrecomputedQ4Source,
+  applyKPrecomputedDKTSource,
 } from './shaders';
 
 /**
@@ -50,6 +55,14 @@ export interface PlatePipelines {
   axpyBuf: GPUComputePipeline;
   updatePBuf: GPUComputePipeline;
   copyScalar: GPUComputePipeline;
+  // Optimized single-dispatch ops (no multi-pass reduction)
+  dotSingle: GPUComputePipeline;
+  computeAlphaPair: GPUComputePipeline;
+  // CSR SpMV (replaces element-by-element K·p)
+  spmvCSR: GPUComputePipeline;
+  // Pre-computed Ke K·p (avoids Gauss quadrature in hot loop)
+  applyKPrecomputedQ4: GPUComputePipeline;
+  applyKPrecomputedDKT: GPUComputePipeline;
 }
 
 /**
@@ -96,6 +109,11 @@ export async function createPipelines(ctx: GPUContext): Promise<PlatePipelines> 
     axpyBuf,
     updatePBuf,
     copyScalar,
+    dotSingle,
+    computeAlphaPair,
+    spmvCSR,
+    applyKPrecomputedQ4,
+    applyKPrecomputedDKT,
   ] = await Promise.all([
     createPipeline(dotProductSource, 'dot_product'),
     createPipeline(reduceSumSource, 'reduce_sum'),
@@ -114,6 +132,11 @@ export async function createPipelines(ctx: GPUContext): Promise<PlatePipelines> 
     createPipeline(axpyBufSource, 'axpy_buf'),
     createPipeline(updatePBufSource, 'update_p_buf'),
     createPipeline(copyScalarSource, 'copy_scalar'),
+    createPipeline(dotSingleSource, 'dot_single'),
+    createPipeline(computeAlphaPairSource, 'compute_alpha_pair'),
+    createPipeline(spmvCSRSource, 'spmv_csr'),
+    createPipeline(applyKPrecomputedQ4Source, 'apply_k_precomputed_q4'),
+    createPipeline(applyKPrecomputedDKTSource, 'apply_k_precomputed_dkt'),
   ]);
 
   return {
@@ -134,6 +157,11 @@ export async function createPipelines(ctx: GPUContext): Promise<PlatePipelines> 
     axpyBuf,
     updatePBuf,
     copyScalar,
+    dotSingle,
+    computeAlphaPair,
+    spmvCSR,
+    applyKPrecomputedQ4,
+    applyKPrecomputedDKT,
   };
 }
 

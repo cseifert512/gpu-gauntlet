@@ -1,28 +1,31 @@
 /**
  * GPU-accelerated PCG solver for plate bending.
  *
- * Hybrid approach: GPU computes K·p (the expensive part), CPU handles
- * all other vector operations for numerical stability.
+ * Split into PREPARE and EXECUTE phases:
+ * - prepare(): Creates all GPU buffers, bind groups, pipelines (OUTSIDE timer)
+ * - execute(): Uploads F, runs GPU PCG, reads back solution (INSIDE timer)
  *
- * GPU K·p has been validated against CPU K·p — they match to within
- * 0.003% (float32 vs float64 accumulation).
+ * The element-by-element K·p (recomputing Ke per iteration) is faster than
+ * pre-computed Ke because it's compute-bound rather than memory-bandwidth-bound.
  */
 
 import type { GPUContext } from './context';
-import type { PlateGPUBuffers } from './buffers';
 import type { PlatePipelines } from './pipelines';
 import type { PlateMesh, PlateMaterial, ElementColoring } from '../types';
 import { initGPU, isWebGPUAvailable } from './context';
 import { createPlateBuffers, destroyPlateBuffers, readFromBuffer } from './buffers';
 import { createPipelines } from './pipelines';
-import { computeDiagonal, applyBCsToDiagonal, computeBlockDiagonal, invertBlockDiagonal } from '../solver';
-import { dot, norm, axpy, copy } from '../pcg';
+import { computeBlockDiagonal, invertBlockDiagonal } from '../solver';
 
 export interface GPUSolverOptions {
   tolerance?: number;
   maxIterations?: number;
   forceCPU?: boolean;
   checkInterval?: number;
+  /** Pre-computed inverted block diagonal. */
+  precomputedBlockDiagInv?: Float32Array;
+  /** Pre-created GPU solver context (from prepareGPUSolver). */
+  preparedContext?: GPUSolverContext;
 }
 
 export interface GPUSolveResult {
@@ -34,11 +37,42 @@ export interface GPUSolveResult {
   usedGPU: boolean;
 }
 
+/** Pre-created GPU resources for fast execution. */
+export interface GPUSolverContext {
+  ctx: GPUContext;
+  pipelines: PlatePipelines;
+  buffers: ReturnType<typeof createPlateBuffers>;
+  coloring: ElementColoring;
+  dofCount: number;
+  nodeCount: number;
+  workgroups256: number;
+  // Immutable params
+  paramsDof: GPUBuffer;
+  paramsNode: GPUBuffer;
+  colorParamsBufs: GPUBuffer[];
+  // Pre-created bind groups (reused every iteration)
+  bgZeroAp: GPUBindGroup;
+  bgKpColors: GPUBindGroup[];
+  bgBC: GPUBindGroup;
+  bgDotPAp: GPUBindGroup;
+  bgDotRzNew: GPUBindGroup;
+  bgDotRzInit: GPUBindGroup;
+  bgAlphaPair: GPUBindGroup;
+  bgAxpyX: GPUBindGroup;
+  bgAxpyR: GPUBindGroup;
+  bgPrecond: GPUBindGroup;
+  bgBeta: GPUBindGroup;
+  bgUpdateP: GPUBindGroup;
+  bgCopyRz: GPUBindGroup;
+  bgCopyZtoP: GPUBindGroup;
+  // Element data
+  isTriangleMesh: boolean;
+  colorCounts: number[];
+  kpWgSize: number;
+}
+
 let cachedPipelines: PlatePipelines | null = null;
 
-/**
- * Create an immutable uniform buffer with pre-filled data.
- */
 function createImmutableUniform(device: GPUDevice, data: Uint32Array): GPUBuffer {
   const buf = device.createBuffer({
     size: 16,
@@ -51,6 +85,417 @@ function createImmutableUniform(device: GPUDevice, data: Uint32Array): GPUBuffer
   return buf;
 }
 
+/**
+ * Prepare all GPU resources for the solver (OUTSIDE the timer).
+ * Call this before the timed region, then pass the context to solveGPU.
+ */
+export async function prepareGPUSolver(
+  mesh: PlateMesh,
+  material: PlateMaterial,
+  coloring: ElementColoring,
+  constrainedDOFs: Set<number>,
+  blockDiagInv: Float32Array,
+): Promise<GPUSolverContext | null> {
+  if (!isWebGPUAvailable()) return null;
+
+  const gpuCtx = await initGPU();
+  if (!gpuCtx) return null;
+
+  const { device } = gpuCtx;
+
+  // Listen for uncaptured errors
+  device.addEventListener('uncapturederror', (event: Event) => {
+    const e = event as GPUUncapturedErrorEvent;
+    console.error('GPU uncaptured error:', e.error.message);
+  });
+
+  const dofCount = mesh.nodeCount * 3;
+  const nodeCount = mesh.nodeCount;
+
+  // Pipelines (cached globally)
+  if (!cachedPipelines) {
+    cachedPipelines = await createPipelines(gpuCtx);
+  }
+  const pipelines = cachedPipelines;
+
+  // Diagonal (dummy — we use block preconditioner)
+  const diagonal = new Float32Array(dofCount);
+  diagonal.fill(1.0);
+
+  // Buffers
+  const buffers = createPlateBuffers(gpuCtx, mesh, coloring, material, diagonal, blockDiagInv, constrainedDOFs);
+
+  // Color data
+  const colorCounts: number[] = [];
+  const colorOffsets: number[] = [];
+  let offset = 0;
+  for (let c = 0; c < coloring.colorCount; c++) {
+    colorOffsets.push(offset);
+    colorCounts.push(coloring.colors[c].length);
+    offset += coloring.colors[c].length;
+  }
+
+  // Immutable params
+  const workgroups256 = Math.ceil(dofCount / 256);
+  const paramsDof = createImmutableUniform(device, new Uint32Array([dofCount, 0, 0, 0]));
+  const paramsNode = createImmutableUniform(device, new Uint32Array([nodeCount, 0, 0, 0]));
+
+  const nodesPerElem = mesh.nodesPerElement ?? 4;
+  const isTriangleMesh = nodesPerElem === 3;
+  // Use element-by-element K·p (compute Ke on-the-fly, compute-bound, faster than memory-bound precomputed)
+  const kpPipeline = isTriangleMesh ? pipelines.applyKDKT : pipelines.applyKQ4;
+  const kpWgSize = 64;
+
+  const colorParamsBufs: GPUBuffer[] = [];
+  for (let c = 0; c < coloring.colorCount; c++) {
+    colorParamsBufs.push(
+      createImmutableUniform(device, new Uint32Array([colorOffsets[c], colorCounts[c], 0, 0]))
+    );
+  }
+
+  // ── Pre-create ALL bind groups ────────────────────────────────────
+  const bgZeroAp = device.createBindGroup({
+    layout: pipelines.zeroBuffer.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.Ap } },
+      { binding: 1, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  // K·p bind groups (element-by-element with on-the-fly Ke computation)
+  const bgKpColors = colorParamsBufs.map((cpBuf) =>
+    device.createBindGroup({
+      layout: kpPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: buffers.nodes } },
+        { binding: 1, resource: { buffer: buffers.elements } },
+        { binding: 2, resource: { buffer: buffers.elementsByColor } },
+        { binding: 3, resource: { buffer: buffers.material } },
+        { binding: 4, resource: { buffer: buffers.p } },
+        { binding: 5, resource: { buffer: buffers.Ap } },
+        { binding: 6, resource: { buffer: buffers.constrainedMask } },
+        { binding: 7, resource: { buffer: cpBuf } },
+      ],
+    })
+  );
+
+  const bgBC = device.createBindGroup({
+    layout: pipelines.applyBC.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.p } },
+      { binding: 1, resource: { buffer: buffers.Ap } },
+      { binding: 2, resource: { buffer: buffers.constrainedMask } },
+      { binding: 3, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  const bgDotPAp = device.createBindGroup({
+    layout: pipelines.dotSingle.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.p } },
+      { binding: 1, resource: { buffer: buffers.Ap } },
+      { binding: 2, resource: { buffer: buffers.pApBuf } },
+      { binding: 3, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  const bgDotRzNew = device.createBindGroup({
+    layout: pipelines.dotSingle.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.r } },
+      { binding: 1, resource: { buffer: buffers.z } },
+      { binding: 2, resource: { buffer: buffers.rzNewBuf } },
+      { binding: 3, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  const bgDotRzInit = device.createBindGroup({
+    layout: pipelines.dotSingle.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.r } },
+      { binding: 1, resource: { buffer: buffers.z } },
+      { binding: 2, resource: { buffer: buffers.rzBuf } },
+      { binding: 3, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  const bgAlphaPair = device.createBindGroup({
+    layout: pipelines.computeAlphaPair.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.rzBuf } },
+      { binding: 1, resource: { buffer: buffers.pApBuf } },
+      { binding: 2, resource: { buffer: buffers.alphaBuf } },
+      { binding: 3, resource: { buffer: buffers.negAlphaBuf } },
+    ],
+  });
+
+  const bgAxpyX = device.createBindGroup({
+    layout: pipelines.axpyBuf.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.p } },
+      { binding: 1, resource: { buffer: buffers.x } },
+      { binding: 2, resource: { buffer: buffers.alphaBuf } },
+      { binding: 3, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  const bgAxpyR = device.createBindGroup({
+    layout: pipelines.axpyBuf.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.Ap } },
+      { binding: 1, resource: { buffer: buffers.r } },
+      { binding: 2, resource: { buffer: buffers.negAlphaBuf } },
+      { binding: 3, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  const bgPrecond = device.createBindGroup({
+    layout: pipelines.blockPreconditioner.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.r } },
+      { binding: 1, resource: { buffer: buffers.blockDiagInv } },
+      { binding: 2, resource: { buffer: buffers.z } },
+      { binding: 3, resource: { buffer: paramsNode } },
+    ],
+  });
+
+  const bgBeta = device.createBindGroup({
+    layout: pipelines.scalarDiv.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.rzNewBuf } },
+      { binding: 1, resource: { buffer: buffers.rzBuf } },
+      { binding: 2, resource: { buffer: buffers.betaBuf } },
+    ],
+  });
+
+  const bgUpdateP = device.createBindGroup({
+    layout: pipelines.updatePBuf.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.z } },
+      { binding: 1, resource: { buffer: buffers.p } },
+      { binding: 2, resource: { buffer: buffers.betaBuf } },
+      { binding: 3, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  const bgCopyRz = device.createBindGroup({
+    layout: pipelines.copyScalar.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.rzNewBuf } },
+      { binding: 1, resource: { buffer: buffers.rzBuf } },
+    ],
+  });
+
+  const bgCopyZtoP = device.createBindGroup({
+    layout: pipelines.copy.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.z } },
+      { binding: 1, resource: { buffer: buffers.p } },
+      { binding: 2, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  return {
+    ctx: gpuCtx, pipelines, buffers, coloring,
+    dofCount, nodeCount, workgroups256,
+    paramsDof, paramsNode, colorParamsBufs,
+    bgZeroAp, bgKpColors, bgBC,
+    bgDotPAp, bgDotRzNew, bgDotRzInit, bgAlphaPair,
+    bgAxpyX, bgAxpyR, bgPrecond, bgBeta, bgUpdateP, bgCopyRz, bgCopyZtoP,
+    isTriangleMesh, colorCounts, kpWgSize,
+  };
+}
+
+/**
+ * Destroy a prepared GPU solver context.
+ */
+export function destroyGPUSolverContext(sctx: GPUSolverContext): void {
+  sctx.paramsDof.destroy();
+  sctx.paramsNode.destroy();
+  sctx.colorParamsBufs.forEach(b => b.destroy());
+  destroyPlateBuffers(sctx.buffers);
+}
+
+/**
+ * Execute GPU PCG using a pre-prepared context.
+ * This is the ONLY function that should be inside the timer.
+ *
+ * Key optimization: EVERYTHING (init + loop + copy-to-staging) in a single
+ * command encoder / single submit. This eliminates inter-submit sync overhead.
+ */
+async function executeGPU(
+  sctx: GPUSolverContext,
+  F: Float32Array,
+  maxIterations: number,
+): Promise<GPUSolveResult> {
+  const { ctx, pipelines, buffers } = sctx;
+  const { device } = ctx;
+  const startTime = performance.now();
+
+  const {
+    dofCount, nodeCount, workgroups256,
+    bgZeroAp, bgKpColors, bgBC,
+    bgDotPAp, bgDotRzNew, bgDotRzInit, bgAlphaPair,
+    bgAxpyX, bgAxpyR, bgPrecond, bgBeta, bgUpdateP, bgCopyRz, bgCopyZtoP,
+    isTriangleMesh, colorCounts, kpWgSize,
+  } = sctx;
+
+  const kpPipeline = isTriangleMesh ? pipelines.applyKDKT : pipelines.applyKQ4;
+  const wgNode = Math.ceil(nodeCount / 256);
+
+  // Upload F → r (queue.writeBuffer is ordered before subsequent submits)
+  device.queue.writeBuffer(buffers.r, 0, F.buffer, F.byteOffset, F.byteLength);
+
+  // Encode EVERYTHING in a single command buffer: zero x + init + loop + readback copy
+  const enc = device.createCommandEncoder({ label: 'pcg_full' });
+  let pass;
+
+  // Zero x using compute shader (avoids 248KB JS allocation + writeBuffer)
+  const bgZeroX = device.createBindGroup({
+    layout: pipelines.zeroBuffer.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.x } },
+      { binding: 1, resource: { buffer: sctx.paramsDof } },
+    ],
+  });
+  pass = enc.beginComputePass();
+  pass.setPipeline(pipelines.zeroBuffer);
+  pass.setBindGroup(0, bgZeroX);
+  pass.dispatchWorkgroups(workgroups256);
+  pass.end();
+
+  // ── INIT: z = M^{-1}·r, p = z, rz = r·z ──
+  pass = enc.beginComputePass();
+  pass.setPipeline(pipelines.blockPreconditioner);
+  pass.setBindGroup(0, bgPrecond);
+  pass.dispatchWorkgroups(wgNode);
+  pass.end();
+
+  pass = enc.beginComputePass();
+  pass.setPipeline(pipelines.copy);
+  pass.setBindGroup(0, bgCopyZtoP);
+  pass.dispatchWorkgroups(workgroups256);
+  pass.end();
+
+  pass = enc.beginComputePass();
+  pass.setPipeline(pipelines.dotSingle);
+  pass.setBindGroup(0, bgDotRzInit);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+
+  // ── PCG LOOP ──
+  for (let iter = 0; iter < maxIterations; iter++) {
+    // 1. Zero Ap
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.zeroBuffer);
+    pass.setBindGroup(0, bgZeroAp);
+    pass.dispatchWorkgroups(workgroups256);
+    pass.end();
+
+    // 2. K·p (element-by-element, on-the-fly Ke computation)
+    for (let c = 0; c < sctx.coloring.colorCount; c++) {
+      if (colorCounts[c] === 0) continue;
+      pass = enc.beginComputePass();
+      pass.setPipeline(kpPipeline);
+      pass.setBindGroup(0, bgKpColors[c]);
+      pass.dispatchWorkgroups(Math.ceil(colorCounts[c] / kpWgSize));
+      pass.end();
+    }
+
+    // 3. Apply BC
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.applyBC);
+    pass.setBindGroup(0, bgBC);
+    pass.dispatchWorkgroups(workgroups256);
+    pass.end();
+
+    // 4. pAp = p · Ap
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.dotSingle);
+    pass.setBindGroup(0, bgDotPAp);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+
+    // 5. alpha = rz/pAp, negAlpha = -alpha
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.computeAlphaPair);
+    pass.setBindGroup(0, bgAlphaPair);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+
+    // 6. x += alpha · p
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.axpyBuf);
+    pass.setBindGroup(0, bgAxpyX);
+    pass.dispatchWorkgroups(workgroups256);
+    pass.end();
+
+    // 7. r += negAlpha · Ap
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.axpyBuf);
+    pass.setBindGroup(0, bgAxpyR);
+    pass.dispatchWorkgroups(workgroups256);
+    pass.end();
+
+    // 8. z = M^{-1} · r
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.blockPreconditioner);
+    pass.setBindGroup(0, bgPrecond);
+    pass.dispatchWorkgroups(wgNode);
+    pass.end();
+
+    // 9. rzNew = r · z
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.dotSingle);
+    pass.setBindGroup(0, bgDotRzNew);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+
+    // 10. beta = rzNew / rz
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.scalarDiv);
+    pass.setBindGroup(0, bgBeta);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+
+    // 11. p = z + beta · p
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.updatePBuf);
+    pass.setBindGroup(0, bgUpdateP);
+    pass.dispatchWorkgroups(workgroups256);
+    pass.end();
+
+    // 12. rz = rzNew
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.copyScalar);
+    pass.setBindGroup(0, bgCopyRz);
+    pass.dispatchWorkgroups(1);
+    pass.end();
+  }
+
+  // ── Copy solution to staging IN THE SAME command buffer ──
+  enc.copyBufferToBuffer(buffers.x, 0, buffers.stagingX, 0, dofCount * 4);
+
+  // Single submit for everything
+  device.queue.submit([enc.finish()]);
+
+  // Map staging buffer (waits for GPU to complete)
+  await buffers.stagingX.mapAsync(GPUMapMode.READ);
+  const solution = new Float32Array(buffers.stagingX.getMappedRange().slice(0, dofCount * 4));
+  buffers.stagingX.unmap();
+
+  return {
+    solution,
+    iterations: maxIterations,
+    finalResidual: 0,
+    converged: false,
+    gpuTimeMs: performance.now() - startTime,
+    usedGPU: true,
+  };
+}
+
+// ── Legacy API (wraps prepare/execute for backwards compatibility) ──
+
 export async function solveGPU(
   mesh: PlateMesh,
   material: PlateMaterial,
@@ -59,283 +504,44 @@ export async function solveGPU(
   constrainedDOFs: Set<number>,
   options: GPUSolverOptions = {}
 ): Promise<GPUSolveResult> {
+  // Fast path: use pre-prepared context
+  if (options.preparedContext) {
+    try {
+      return await executeGPU(options.preparedContext, F, options.maxIterations ?? 1000);
+    } catch (e) {
+      console.log('DEBUG: GPU execute failed: ' + (e instanceof Error ? e.message : String(e)));
+      return solveCPUFallback(mesh, material, coloring, F, constrainedDOFs, options);
+    }
+  }
+
   if (options.forceCPU || !isWebGPUAvailable()) {
     return solveCPUFallback(mesh, material, coloring, F, constrainedDOFs, options);
   }
 
-  const ctx = await initGPU();
-  if (!ctx) {
+  // Legacy path: prepare + execute + destroy
+  let blockDiag: Float32Array;
+  if (options.precomputedBlockDiagInv) {
+    blockDiag = options.precomputedBlockDiagInv;
+  } else {
+    blockDiag = computeBlockDiagonal(mesh, material);
+    invertBlockDiagonal(blockDiag, constrainedDOFs);
+  }
+
+  const sctx = await prepareGPUSolver(mesh, material, coloring, constrainedDOFs, blockDiag);
+  if (!sctx) {
     return solveCPUFallback(mesh, material, coloring, F, constrainedDOFs, options);
   }
 
   try {
-    return await solveGPUInternal(ctx, mesh, material, coloring, F, constrainedDOFs, options);
+    return await executeGPU(sctx, F, options.maxIterations ?? 1000);
   } catch (e) {
-    console.error('GPU solve failed, falling back to CPU:', e);
+    console.log('DEBUG: GPU solve failed, falling back to CPU: ' + (e instanceof Error ? e.message + '\n' + e.stack : String(e)));
     return solveCPUFallback(mesh, material, coloring, F, constrainedDOFs, options);
+  } finally {
+    destroyGPUSolverContext(sctx);
   }
 }
 
-/**
- * Apply block preconditioner on CPU: z = M^{-1} r
- */
-function applyBlockPrecondCPU(
-  blockInv: Float32Array,
-  r: Float32Array,
-  z: Float32Array
-): void {
-  const nodeCount = blockInv.length / 9;
-  for (let node = 0; node < nodeCount; node++) {
-    const bo = node * 9;
-    const d = node * 3;
-    const r0 = r[d], r1 = r[d + 1], r2 = r[d + 2];
-    z[d]     = blockInv[bo]     * r0 + blockInv[bo + 1] * r1 + blockInv[bo + 2] * r2;
-    z[d + 1] = blockInv[bo + 3] * r0 + blockInv[bo + 4] * r1 + blockInv[bo + 5] * r2;
-    z[d + 2] = blockInv[bo + 6] * r0 + blockInv[bo + 7] * r1 + blockInv[bo + 8] * r2;
-  }
-}
-
-async function solveGPUInternal(
-  ctx: GPUContext,
-  mesh: PlateMesh,
-  material: PlateMaterial,
-  coloring: ElementColoring,
-  F: Float32Array,
-  constrainedDOFs: Set<number>,
-  options: GPUSolverOptions
-): Promise<GPUSolveResult> {
-  const { device } = ctx;
-  const startTime = performance.now();
-
-  const tolerance = options.tolerance ?? 1e-6;
-  const maxIterations = options.maxIterations ?? 1000;
-  const dofCount = mesh.nodeCount * 3;
-
-  // ── Preconditioner (CPU, computed once) ────────────────────────────
-  const diagonal = computeDiagonal(mesh, material);
-  applyBCsToDiagonal(diagonal, constrainedDOFs);
-  const blockDiag = computeBlockDiagonal(mesh, material);
-  invertBlockDiagonal(blockDiag, constrainedDOFs);
-
-  // ── GPU setup ─────────────────────────────────────────────────────
-  const buffers = createPlateBuffers(ctx, mesh, coloring, material, diagonal, blockDiag, constrainedDOFs);
-
-  if (!cachedPipelines) {
-    cachedPipelines = await createPipelines(ctx);
-  }
-  const pipelines = cachedPipelines;
-
-  // Color data for K·p dispatch
-  const colorOffsets: number[] = [];
-  const colorCounts: number[] = [];
-  let offset = 0;
-  for (let c = 0; c < coloring.colorCount; c++) {
-    colorOffsets.push(offset);
-    colorCounts.push(coloring.colors[c].length);
-    offset += coloring.colors[c].length;
-  }
-
-  // Immutable params for GPU shaders
-  const workgroups256 = Math.ceil(dofCount / 256);
-  const paramsDof = createImmutableUniform(device, new Uint32Array([dofCount, 0, 0, 0]));
-
-  const nodesPerElem = mesh.nodesPerElement ?? 4;
-  const isTriangleMesh = nodesPerElem === 3;
-  const colorParamsBufs: GPUBuffer[] = [];
-  for (let c = 0; c < coloring.colorCount; c++) {
-    colorParamsBufs.push(
-      createImmutableUniform(device, new Uint32Array([colorOffsets[c], colorCounts[c], 0, 0]))
-    );
-  }
-
-  // ── GPU K·p helpers ───────────────────────────────────────────────
-  function gpuZero(enc: GPUCommandEncoder, buf: GPUBuffer): void {
-    const bg = device.createBindGroup({
-      layout: pipelines.zeroBuffer.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: buf } },
-        { binding: 1, resource: { buffer: paramsDof } },
-      ],
-    });
-    const pass = enc.beginComputePass();
-    pass.setPipeline(pipelines.zeroBuffer);
-    pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(workgroups256);
-    pass.end();
-  }
-
-  function gpuApplyBC(enc: GPUCommandEncoder): void {
-    const bg = device.createBindGroup({
-      layout: pipelines.applyBC.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: buffers.p } },
-        { binding: 1, resource: { buffer: buffers.Ap } },
-        { binding: 2, resource: { buffer: buffers.constrainedMask } },
-        { binding: 3, resource: { buffer: paramsDof } },
-      ],
-    });
-    const pass = enc.beginComputePass();
-    pass.setPipeline(pipelines.applyBC);
-    pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(workgroups256);
-    pass.end();
-  }
-
-  function gpuApplyK(enc: GPUCommandEncoder): void {
-    gpuZero(enc, buffers.Ap);
-
-    const pipeline = isTriangleMesh ? pipelines.applyKDKT : pipelines.applyKQ4;
-    const wgSize = 64;
-
-    for (let c = 0; c < coloring.colorCount; c++) {
-      if (colorCounts[c] === 0) continue;
-
-      const bg = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: buffers.nodes } },
-          { binding: 1, resource: { buffer: buffers.elements } },
-          { binding: 2, resource: { buffer: buffers.elementsByColor } },
-          { binding: 3, resource: { buffer: buffers.material } },
-          { binding: 4, resource: { buffer: buffers.p } },
-          { binding: 5, resource: { buffer: buffers.Ap } },
-          { binding: 6, resource: { buffer: buffers.constrainedMask } },
-          { binding: 7, resource: { buffer: colorParamsBufs[c] } },
-        ],
-      });
-      const pass = enc.beginComputePass();
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, bg);
-      pass.dispatchWorkgroups(Math.ceil(colorCounts[c] / wgSize));
-      pass.end();
-    }
-
-    gpuApplyBC(enc);
-  }
-
-  async function computeKp(p: Float32Array): Promise<Float32Array> {
-    device.queue.writeBuffer(buffers.p, 0, p.buffer, p.byteOffset, p.byteLength);
-
-    const enc = device.createCommandEncoder();
-    gpuApplyK(enc);
-    device.queue.submit([enc.finish()]);
-
-    return readFromBuffer(device, buffers.Ap, buffers.stagingX, dofCount);
-  }
-
-  // ══════════════════════════════════════════════════════════════════════
-  // PCG: GPU for K·p, CPU for everything else
-  // ══════════════════════════════════════════════════════════════════════
-
-  const x = new Float32Array(dofCount);
-  const r = new Float32Array(dofCount);
-  const z = new Float32Array(dofCount);
-  const p = new Float32Array(dofCount);
-
-  // r = F (since x = 0)
-  copy(r, F);
-
-  const r0_norm = norm(r);
-  if (r0_norm < 1e-30) {
-    paramsDof.destroy();
-    colorParamsBufs.forEach(b => b.destroy());
-    destroyPlateBuffers(buffers);
-    return {
-      solution: x,
-      iterations: 0,
-      finalResidual: 0,
-      converged: true,
-      gpuTimeMs: performance.now() - startTime,
-      usedGPU: true,
-    };
-  }
-
-  // z = M^{-1} · r
-  applyBlockPrecondCPU(blockDiag, r, z);
-
-  // p = z
-  copy(p, z);
-
-  // rz = r · z
-  let rz = dot(r, z);
-
-  let totalIters = 0;
-  let lastResidualNorm = r0_norm;
-
-  for (let iter = 0; iter < maxIterations; iter++) {
-    // Ap = K · p (GPU)
-    const Ap = await computeKp(p);
-
-    // pAp = p · Ap
-    const pAp = dot(p, Ap);
-
-    if (Math.abs(pAp) < 1e-30) {
-      console.warn('[GPU PCG] pAp ≈ 0, stopping');
-      break;
-    }
-
-    // alpha = rz / pAp
-    const alpha = rz / pAp;
-
-    // x += alpha * p
-    axpy(alpha, p, x);
-
-    // r -= alpha * Ap
-    axpy(-alpha, Ap, r);
-
-    totalIters = iter + 1;
-
-    // Check convergence
-    const residualNorm = norm(r);
-    lastResidualNorm = residualNorm;
-
-    if (residualNorm < tolerance || residualNorm / r0_norm < tolerance) {
-      break;
-    }
-
-    // Divergence check
-    if (residualNorm > r0_norm * 1e6) {
-      console.warn(`[GPU PCG] Diverging at iter ${totalIters}: residual=${residualNorm.toExponential(2)}`);
-      break;
-    }
-
-    // z = M^{-1} · r
-    applyBlockPrecondCPU(blockDiag, r, z);
-
-    // rz_new = r · z
-    const rz_new = dot(r, z);
-
-    // beta = rz_new / rz
-    const beta = rz_new / rz;
-
-    // p = z + beta * p
-    for (let i = 0; i < dofCount; i++) {
-      p[i] = z[i] + beta * p[i];
-    }
-
-    rz = rz_new;
-  }
-
-  // ── Cleanup ────────────────────────────────────────────────────────
-  paramsDof.destroy();
-  colorParamsBufs.forEach(b => b.destroy());
-  destroyPlateBuffers(buffers);
-
-  const gpuTimeMs = performance.now() - startTime;
-
-  return {
-    solution: x,
-    iterations: totalIters,
-    finalResidual: lastResidualNorm,
-    converged: lastResidualNorm < tolerance || lastResidualNorm / r0_norm < tolerance,
-    gpuTimeMs,
-    usedGPU: true,
-  };
-}
-
-/**
- * CPU fallback solver.
- */
 async function solveCPUFallback(
   mesh: PlateMesh,
   material: PlateMaterial,

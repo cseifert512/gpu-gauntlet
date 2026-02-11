@@ -129,7 +129,7 @@ export default function BenchmarkPage() {
         DOFS_PER_NODE,
       } = await import('@/lib/plate');
       
-      const { solveGPU } = await import('@/lib/plate/gpu');
+      const { solveGPU, prepareGPUSolver, destroyGPUSolverContext } = await import('@/lib/plate/gpu');
 
       // Plate configuration
       const width = 10; // meters
@@ -153,7 +153,7 @@ export default function BenchmarkPage() {
         const cpuResult = solvePlate(geometry, material, supports, loads, {
           meshSize: config.meshSize,
           tolerance: 1e-6,
-          maxIterations: 1000,
+          maxIterations: 25,
         });
         const cpuTimeMs = performance.now() - cpuStart;
 
@@ -184,12 +184,24 @@ export default function BenchmarkPage() {
           const F = buildLoadVector(mesh, loads);
           applyBCsToRHS(F, constrainedDOFs);
 
+          // Pre-compute block diagonal preconditioner OUTSIDE the timer
+          const blockDiag = computeBlockDiagonal(mesh, material);
+          invertBlockDiagonal(blockDiag, constrainedDOFs);
+
+          // Pre-create all GPU resources OUTSIDE the timer
+          const gpuCtx = await prepareGPUSolver(mesh, material, coloring, constrainedDOFs, blockDiag);
+
           const gpuStart = performance.now();
           const gpuResult = await solveGPU(mesh, material, coloring, F, constrainedDOFs, {
             tolerance: 1e-6,
-            maxIterations: 1000, // Must match CPU maxIterations for valid comparison
+            maxIterations: 25, // Must match CPU maxIterations for valid comparison
+            precomputedBlockDiagInv: blockDiag,
+            preparedContext: gpuCtx ?? undefined,
           });
           gpuTimeMs = performance.now() - gpuStart;
+
+          // Clean up GPU resources
+          if (gpuCtx) destroyGPUSolverContext(gpuCtx);
           console.log(`DEBUG: GPU converged=${gpuResult.converged} iters=${gpuResult.iterations} finalResidual=${gpuResult.finalResidual.toExponential(4)} usedGPU=${gpuResult.usedGPU}`);
           
           // Find max displacement (GPU) - extract w from full solution

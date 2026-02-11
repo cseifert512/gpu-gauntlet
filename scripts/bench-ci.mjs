@@ -165,6 +165,7 @@ async function attemptOnce() {
 
     page.on("console", (msg) => {
       const text = msg.text();
+      const type = msg.type(); // 'log', 'error', 'warning', etc.
 
       if (text.startsWith("ADAPTER:")) {
         adapterLine = text;
@@ -180,6 +181,10 @@ async function attemptOnce() {
       }
       if (text.startsWith("DEBUG:")) {
         console.log(`[page] ${text}`);
+      }
+      // Capture errors and warnings for debugging
+      if (type === "error" || type === "warning") {
+        console.log(`[page:${type}] ${text}`);
       }
       if (text === "BENCHMARK_COMPLETE") {
         benchmarkComplete = true;
