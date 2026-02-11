@@ -1,0 +1,4 @@
+[2026-02-11T04:59:43.465Z] ADAPTER: (missing) | (no target line)
+[2026-02-11T05:05:52.566Z] ADAPTER: nvidia | turing | DOF: 4107 | CPU: 695.9ms | GPU: 9460.8ms | Valid: FAIL
+[2026-02-11T05:07:23.793Z] ADAPTER: nvidia | turing | DOF: 4107 | CPU: 698.8ms | GPU: 9491.6ms | Valid: FAIL
+[2026-02-11T05:08:15.144Z] ADAPTER: nvidia | turing | DOF: 4107 | CPU: 708.5ms | GPU: 9508.0ms | Valid: FAIL

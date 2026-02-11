@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import Link from 'next/link';
 
 interface BenchmarkResult {
@@ -31,6 +31,7 @@ export default function BenchmarkPage() {
   const [error, setError] = useState<string | null>(null);
   const [gpuSupported, setGpuSupported] = useState<boolean | null>(null);
   const [gpuInfo, setGpuInfo] = useState<string>('Checking...');
+  const autoTriggered = useRef(false);
 
   // Check GPU support on mount
   useEffect(() => {
@@ -52,11 +53,24 @@ export default function BenchmarkPage() {
         return;
       }
 
+      // ── Log adapter info for CI harness ──
+      try {
+        const info: Record<string, string> =
+          (adapter as any).info ??
+          (await (adapter as any).requestAdapterInfo?.()) ??
+          {};
+        const desc = [info.vendor, info.architecture, info.device, info.description]
+          .filter(Boolean)
+          .join(' | ');
+        console.log('ADAPTER:', desc || 'unknown');
+        setGpuInfo(`WebGPU GPU: ${desc || 'detected'}`);
+      } catch {
+        console.log('ADAPTER: unknown (info unavailable)');
+        setGpuInfo('WebGPU GPU detected');
+      }
+
       const device = await adapter.requestDevice();
       setGpuSupported(true);
-      
-      // GPU detected
-      setGpuInfo('WebGPU GPU detected');
       
       device.destroy();
     } catch (err) {
@@ -64,6 +78,20 @@ export default function BenchmarkPage() {
       setGpuInfo(`GPU init failed: ${err}`);
     }
   };
+
+  // ── Auto-run when ?auto=1 is in the URL ──
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('auto') && gpuSupported === true && !autoTriggered.current && !isRunning) {
+      autoTriggered.current = true;
+      // Small delay to ensure React is fully settled
+      const t = setTimeout(() => {
+        document.getElementById('run-benchmark-btn')?.click();
+      }, 500);
+      return () => clearTimeout(t);
+    }
+  }, [gpuSupported, isRunning]);
 
   const runBenchmark = useCallback(async () => {
     if (!gpuSupported) {
@@ -181,10 +209,22 @@ export default function BenchmarkPage() {
           targetMet,
         };
 
+        // ── Console log for CI harness ──
+        const validStr = validationPassed ? 'PASS' : 'FAIL';
+        if (gpuTimeMs > 0) {
+          console.log(`DOF: ${actualDOF} | CPU: ${cpuTimeMs.toFixed(1)}ms | GPU: ${gpuTimeMs.toFixed(1)}ms | Valid: ${validStr}`);
+        } else {
+          console.log(`DOF: ${actualDOF} | CPU: ${cpuTimeMs.toFixed(1)}ms | GPU: FAILED | Valid: FAIL`);
+        }
+
         setResults(prev => [...prev, result]);
       }
+
+      // Signal to CI that the benchmark is done
+      console.log('BENCHMARK_COMPLETE');
     } catch (err) {
       setError(`Benchmark failed: ${err}`);
+      console.log('BENCHMARK_COMPLETE');
     } finally {
       setIsRunning(false);
       setCurrentTest(null);
@@ -234,6 +274,7 @@ export default function BenchmarkPage() {
       {/* Run Button */}
       <section className="mb-8">
         <button
+          id="run-benchmark-btn"
           onClick={runBenchmark}
           disabled={isRunning || !gpuSupported}
           className="btn-primary text-lg px-8 py-4 w-full md:w-auto"
