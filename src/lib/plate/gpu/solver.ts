@@ -295,6 +295,20 @@ export async function prepareGPUSolver(
     ],
   });
 
+  // ── GPU warm-up: force the GPU pipeline to be "hot" ──
+  // Submit a small no-op dispatch and wait for it to complete.
+  // This eliminates cold-start scheduling jitter that can add 2-4ms.
+  {
+    const warmEnc = device.createCommandEncoder({ label: 'warmup' });
+    const warmPass = warmEnc.beginComputePass();
+    warmPass.setPipeline(pipelines.zeroBuffer);
+    warmPass.setBindGroup(0, bgZeroAp);
+    warmPass.dispatchWorkgroups(1);
+    warmPass.end();
+    device.queue.submit([warmEnc.finish()]);
+    await device.queue.onSubmittedWorkDone();
+  }
+
   return {
     ctx: gpuCtx, pipelines, buffers, coloring,
     dofCount, nodeCount, workgroups256,
