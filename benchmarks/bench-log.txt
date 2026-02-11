@@ -4,3 +4,14 @@
 [2026-02-11T05:08:15.144Z] ADAPTER: nvidia | turing | DOF: 4107 | CPU: 708.5ms | GPU: 9508.0ms | Valid: FAIL
 [2026-02-11T05:15:06.708Z] ADAPTER: nvidia | turing | DOF: 4107 | CPU: 675.1ms | GPU: 9517.5ms | Valid: FAIL
 [2026-02-11T05:15:56.244Z] ADAPTER: nvidia | turing | DOF: 4107 | CPU: 673.2ms | GPU: 9568.3ms | Valid: FAIL
+[2026-02-11T05:30:55.556Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 9462.9ms | GPU: 303.8ms | Valid: FAIL
+[2026-02-11T05:37:19.674Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 10203.7ms | GPU: 841.0ms | Valid: FAIL
+[2026-02-11T06:10:29.497Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 10127.8ms | GPU: 858.0ms | Valid: FAIL
+[2026-02-11T06:18:07.473Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 9417.1ms | GPU: 9150.1ms | Valid: FAIL
+[2026-02-11T06:22:44.919Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 10377.0ms | GPU: 9068.5ms | Valid: FAIL
+[2026-02-11T06:32:18.342Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 9469.6ms | GPU: 22104.4ms | Valid: FAIL
+[2026-02-11T06:36:23.795Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 9399.1ms | GPU: 20585.9ms | Valid: FAIL
+[2026-02-11T06:39:40.457Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 9539.5ms | GPU: 20016.7ms | Valid: FAIL
+[2026-02-11T06:43:59.023Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 9187.4ms | GPU: 4788.7ms | Valid: FAIL
+[2026-02-11T06:46:03.838Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 10316.0ms | GPU: 4783.1ms | Valid: PASS
+[2026-02-11T06:47:41.458Z] ADAPTER: nvidia | turing | DOF: 62208 | CPU: 9505.8ms | GPU: 4836.8ms | Valid: PASS
