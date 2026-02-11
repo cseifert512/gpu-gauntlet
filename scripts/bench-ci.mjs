@@ -1,14 +1,36 @@
 /**
- * bench-ci.mjs — Run the /benchmark page via puppeteer-core + local Chrome.
+ * bench-ci.mjs — Automated benchmark runner for the WebGPU plate solver.
+ *
+ * Launches a Next.js dev server + Chrome (non-headless, via puppeteer-core),
+ * navigates to the /benchmark page, captures console output, validates the
+ * GPU adapter, parses results, and exits with a specific code.
+ *
+ * Usage:
+ *   npm run bench:ci                    # Standard run
+ *   PORT=3000 npm run bench:ci          # Custom port
+ *   CHROME_PATH=/path/to/chrome npm run bench:ci  # Custom Chrome
+ *
+ * What it does:
+ *   1. Kills any process on port 3456 (configurable via PORT env var)
+ *   2. Starts `next dev` on that port
+ *   3. Launches local Chrome with a fresh temp profile (avoids lock conflicts)
+ *   4. Navigates to /benchmark?auto=1&target=1 (runs only the largest config)
+ *   5. Captures ADAPTER:, DOF/GPU/Valid lines, and BENCHMARK_COMPLETE from console
+ *   6. Validates: adapter is real GPU (not software), benchmark output parses, Valid=PASS
+ *   7. Logs one-line result to benchmarks/bench-log.txt
+ *   8. Exits with code (see below)
+ *   9. Retries once on automation failures (exit 99)
  *
  * Exit codes:
- *   0  = PASS and GPU < 20 ms
- *   1  = PASS but GPU >= 20 ms  (expected for now)
- *  10  = validation failed
- *  11  = could not parse GPU ms
- *  99  = automation failure (crash, timeout, no output, etc.)
+ *   0  = PASS and GPU < 20 ms  — target met
+ *   1  = PASS but GPU >= 20 ms — solver works but too slow
+ *  10  = validation failed (GPU result doesn't match CPU)
+ *  11  = could not parse GPU time from benchmark output
+ *  99  = automation failure (Chrome crash, timeout, no output, bad adapter)
  *
- * Retries once automatically on failure.
+ * Prerequisites:
+ *   npm install puppeteer-core wait-on
+ *   Google Chrome installed locally
  */
 
 import { spawn, execSync } from "node:child_process";

@@ -1,13 +1,39 @@
 /**
- * Shader source loading.
+ * WGSL compute shader sources for the GPU plate solver.
  *
- * This module provides shader sources as strings.
- * Works in both browser (bundled) and Node.js (Jest) environments.
+ * All shaders are inlined as template strings for cross-platform compatibility
+ * (works in both browser/bundler and Node.js/Jest environments).
+ *
+ * Shader categories:
+ *   K·p (stiffness matrix-vector product):
+ *     - applyKQ4Source / applyKDKTSource: Element-by-element with on-the-fly Ke
+ *     - applyKPrecomputedQ4Source / applyKPrecomputedDKTSource: Pre-computed Ke
+ *     - spmvCSRSource: CSR sparse matrix-vector (experimental)
+ *
+ *   PCG vector operations:
+ *     - axpySource: y += α·x (α from uniform)
+ *     - axpyBufSource: y += α[0]·x (α from GPU buffer — no CPU readback)
+ *     - updatePSource: p = z + β·p (β from uniform)
+ *     - updatePBufSource: p = z + β[0]·p (β from GPU buffer)
+ *     - copySource, scaleSource, zeroBufferSource: basic vector ops
+ *
+ *   PCG scalar operations (GPU-resident, eliminate CPU roundtrips):
+ *     - dotSingleSource: Single-workgroup dot product → result[0]
+ *     - computeAlphaPairSource: α = rz/pAp, -α (combined)
+ *     - scalarDivSource / scalarNegDivSource: c = a/b, c = -(a/b)
+ *     - copyScalarSource: dst[0] = src[0]
+ *
+ *   Preconditioner:
+ *     - preconditionerSource: Scalar Jacobi z = r/diag
+ *     - blockPreconditionerSource: Block Jacobi z = M⁻¹·r (3×3 per node)
+ *
+ *   Boundary conditions:
+ *     - applyBCSource: y[constrained] = x[constrained]
+ *
+ *   Reduction:
+ *     - dotProductSource: Multi-workgroup partial sums
+ *     - reduceSumSource: Final reduction of partial sums
  */
-
-// In Node.js/Jest environment, we load shaders from files
-// In browser with bundler, these would be imported with ?raw
-// For now, we inline them as template strings for cross-platform compatibility
 
 export const dotProductSource = /* wgsl */ `
 // dot_product.wgsl

@@ -1,12 +1,27 @@
 /**
- * overnight.mjs — Loop `npm run bench:ci` up to MAX_ITERS times.
+ * overnight.mjs — Stability loop for automated overnight benchmarking.
  *
- * Stops on:
- *   - exit code 0  → target met (GPU < 20 ms + PASS)
- *   - exit code 99 → automation failure (don't keep looping)
- *   - MAX_ITERS reached
+ * Repeatedly runs `npm run bench:ci` and logs results. This is a "dumb loop"
+ * that does NOT modify code or trigger AI agents — it only tests stability.
  *
- * Appends a row per iteration to .cursor/scratchpad.md and benchmarks/bench-log.txt.
+ * Usage:
+ *   npm run overnight                # Run up to 200 iterations
+ *   MAX_ITERS=10 npm run overnight   # Custom iteration limit
+ *
+ * Behavior:
+ *   - Runs bench:ci in a loop with 5s pause between iterations
+ *   - Logs timestamped results to .cursor/scratchpad.md (markdown table)
+ *   - Also logs to benchmarks/bench-log.txt via bench-ci.mjs
+ *
+ * Stop conditions:
+ *   - Exit code 0:  Target met (GPU < 20ms + PASS) — success!
+ *   - Exit code 99: Automation failure — stops to prevent infinite crash loop
+ *   - MAX_ITERS:    Iteration limit reached without meeting target
+ *
+ * Exit codes (this script):
+ *   0  = Target met
+ *   1  = Iteration limit reached
+ *   99 = Automation failure propagated
  */
 
 import { spawnSync } from "node:child_process";

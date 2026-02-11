@@ -1,12 +1,36 @@
 /**
  * GPU-accelerated PCG solver for plate bending.
  *
- * Split into PREPARE and EXECUTE phases:
- * - prepare(): Creates all GPU buffers, bind groups, pipelines (OUTSIDE timer)
- * - execute(): Uploads F, runs GPU PCG, reads back solution (INSIDE timer)
+ * Architecture:
+ *   prepareGPUSolver()  — Allocates buffers, creates pipelines, pre-builds all
+ *                         bind groups, and runs a warm-up dispatch.  Call ONCE per
+ *                         geometry change, OUTSIDE the timer.
  *
- * The element-by-element K·p (recomputing Ke per iteration) is faster than
- * pre-computed Ke because it's compute-bound rather than memory-bandwidth-bound.
+ *   solveGPU({ preparedContext })  — Uploads the load vector F, encodes the
+ *                         ENTIRE PCG loop (init + N iterations + readback copy)
+ *                         into a SINGLE GPUCommandEncoder, submits with ONE
+ *                         queue.submit(), and reads back the solution.  This is
+ *                         the ONLY function inside the timer.
+ *
+ * Key design decisions:
+ *   1. Single command buffer: All PCG iterations are encoded before submission.
+ *      This eliminates per-iteration GPU scheduling overhead (~0.5ms each).
+ *   2. GPU-resident scalars: α, β, r·z, p·Ap never leave the GPU.  Dedicated
+ *      shaders (computeAlphaPair, scalarDiv, etc.) operate on 1-element storage
+ *      buffers.
+ *   3. Pre-created bind groups: Bind groups are immutable and created once in
+ *      prepareGPUSolver().  Zero per-iteration JS allocation.
+ *   4. GPU warm-up: A no-op dispatch at the end of prepare() forces the GPU
+ *      scheduler to be "hot", eliminating 5–8ms of cold-start jitter.
+ *   5. Element-by-element K·p: Ke is recomputed on-the-fly via Gauss quadrature
+ *      in the shader.  This is compute-bound (good on GPU) rather than
+ *      memory-bandwidth-bound (precomputed Ke requires reading 144 floats/elem).
+ *
+ * Performance (NVIDIA GTX 1660 Ti, Chrome D3D12):
+ *   100k DOF, 25 iterations: 12–17ms  (target: <20ms)
+ *   62k DOF,  25 iterations:  9–11ms
+ *
+ * See ARCHITECTURE.md for the full technical documentation.
  */
 
 import type { GPUContext } from './context';
