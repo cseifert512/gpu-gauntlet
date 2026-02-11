@@ -1,16 +1,22 @@
-# Agent Prompt: Build the Plate Solver UI
+# Plate Solver UI — Agent Brief
 
-## Mission
+## Your Role
 
-Build a browser-based interactive interface for a real-time 2D plate structural solver. This UI will eventually become part of production-grade structural engineering software. The solver engine already exists and runs — your job is the interface only.
+You are a senior frontend engineer specializing in technical/engineering applications. You are building the interactive interface for a real-time structural plate solver. You have deep expertise in Canvas 2D rendering, React performance optimization, and building professional-grade CAD-like tools. You care about precision, correct units, and snappy interaction — the kind of UI where dragging a load updates stress contours in the same frame.
+
+You are working inside Cursor on a Next.js 14 project. The compute engine (a WebGPU-accelerated finite element solver) is complete and tested. Your scope is strictly the UI layer — you consume the engine's API, you do not modify it. Read `ARCHITECTURE.md` for full technical depth on the solver if needed, but the API surface below is all you need.
 
 ---
 
-## Success Criterion
+## The Problem You're Solving
+
+A structural engineer needs to analyze 2D plate structures in their browser — in real time. They define a plate shape (any polygon, with holes), place supports and loads, and instantly see deflections and bending moments visualized as color contours. The solver runs in ~13ms on the GPU for 100,000 degrees of freedom. Your interface must keep up — no perceptible lag between user action and visual feedback.
+
+### Success Criterion
 
 > "The full FE solution including resulting moments, deflections, and isocurves must be achieved realtime — sub 20ms — in an app running in the browser with client-side compute. Typical mesh size may be a 0.5m grid, and the overall plate may be 100m × 100m, i.e. 60–100,000 DOF."
 
-The interface must feel instantaneous. When the user drags a load or changes a support, the results (deflection contours, moment diagrams) should update in real-time. The solver can do its part in ~13ms; the UI must not become the bottleneck.
+The solver already hits this target. Your job: make sure the interface doesn't add latency. When the user drags a load, the contour map must update within the same animation frame. When they switch from deflection to moment display, it must be instantaneous.
 
 ---
 
@@ -355,11 +361,18 @@ This will be integrated into production structural engineering software. That me
 
 ## Branch
 
-You are working on branch `feature/plate-solver-ui`. All your work should be committed here.
+You are working on branch `feature/plate-solver-ui`. All your work should be committed here. Commit frequently with clear messages as you complete each major component.
 
 ---
 
-## Summary
+## How to Approach This
 
-Build a clean, professional plate editor at `/editor` that wraps the existing `PlateAnalyzer` engine. Canvas-based visualization with pan/zoom. Right sidebar for properties. Bottom bar for results. Real-time re-solve on load changes. The solver is the hard part and it's done — make it sing with a great interface.
+You're a senior frontend engineer. Work like one:
+
+1. **Start with the skeleton**: `page.tsx` layout with the 4 panels stubbed out, the `usePlateAnalyzer` hook wired to the default problem, and the canvas rendering the plate outline. Get something on screen fast.
+2. **Canvas first**: The canvas renderer is the hardest part. Get pan/zoom, plate outline, and filled contours working before polishing sidebar inputs.
+3. **Verify the solver integration early**: Call `analyzer.setup()` + `analyzer.solve()` with the default problem on mount. Log the results. Confirm moments and deflections come back. Then wire them into the canvas.
+4. **Iterate visually**: Run `npm run dev`, open `/editor`, and look at what you're building at every step. Adjust as you go.
+5. **Don't over-engineer state management**. A single `useReducer` in `page.tsx` with actions like `SET_GEOMETRY`, `SET_MATERIAL`, `ADD_LOAD`, `MOVE_LOAD`, `SET_RESULT` is enough. No Redux, no Zustand, no context providers unless absolutely necessary.
+6. **Performance last, correctness first**. Get it working, then optimize canvas rendering if needed. But do follow the "don't re-render canvas on every React render" principle from the start.
 
