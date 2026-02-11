@@ -21,7 +21,7 @@ import puppeteer from "puppeteer-core";
 /* ─── configuration ─── */
 
 const PORT = process.env.PORT || "3456";
-const URL  = `http://localhost:${PORT}/benchmark?auto=1`;
+const URL  = `http://localhost:${PORT}/benchmark?auto=1&target=1`;
 
 const BAD_ADAPTER_SUBSTRINGS = [
   "Basic Render Driver",
@@ -124,6 +124,7 @@ async function attemptOnce() {
   dev.stderr?.on("data", (d) => process.stderr.write(d));
 
   let browser = null;
+  let userDataDir = null;
   try {
     /* 3. Wait for server */
     await waitOn({
@@ -135,7 +136,7 @@ async function attemptOnce() {
     console.log(`\n[bench-ci] Dev server ready on port ${PORT}`);
 
     /* 4. Launch Chrome — use a temp profile to avoid lock-file conflicts */
-    const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bench-chrome-"));
+    userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "bench-chrome-"));
     browser = await puppeteer.launch({
       headless: false,
       executablePath: CHROME_PATH,
@@ -177,6 +178,9 @@ async function attemptOnce() {
         benchLines.push(text);
         console.log(`[page] ${text}`);
       }
+      if (text.startsWith("DEBUG:")) {
+        console.log(`[page] ${text}`);
+      }
       if (text === "BENCHMARK_COMPLETE") {
         benchmarkComplete = true;
         console.log("[bench-ci] Benchmark run finished.");
@@ -190,8 +194,31 @@ async function attemptOnce() {
     /* 6. Navigate */
     await page.goto(URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
 
+    /* 6b. Wait a moment for the page to hydrate and log adapter info */
+    await sleep(3000);
+
+    /* 6c. If ADAPTER not captured yet, query it directly */
+    if (!adapterLine) {
+      try {
+        const adapter = await page.evaluate(async () => {
+          if (!navigator.gpu) return 'ADAPTER: no WebGPU';
+          const a = await navigator.gpu.requestAdapter();
+          if (!a) return 'ADAPTER: no adapter';
+          const info = a.info ?? {};
+          const desc = [info.vendor, info.architecture, info.device, info.description]
+            .filter(Boolean)
+            .join(' | ');
+          return `ADAPTER: ${desc || 'unknown'}`;
+        });
+        adapterLine = adapter;
+        console.log(`[bench-ci] (direct query) ${adapterLine}`);
+      } catch (e) {
+        console.warn(`[bench-ci] Could not query adapter directly: ${e.message}`);
+      }
+    }
+
     /* 7. Wait for completion or timeout */
-    const TIMEOUT_MS = 300_000; // 5 min
+    const TIMEOUT_MS = 600_000; // 10 min (61k DOF solver can be slow unoptimized)
     const start = Date.now();
 
     while (Date.now() - start < TIMEOUT_MS) {
@@ -214,8 +241,9 @@ async function attemptOnce() {
 
     /* 9. Validate adapter */
     if (!adapterLine) {
+      console.error("[bench-ci] Captured console lines:", benchLines);
       const e = new Error(
-        "Missing ADAPTER line. The /benchmark page must console.log('ADAPTER: ...').",
+        "Missing ADAPTER line. Did you add the adapter console.log on /benchmark?",
       );
       e.code = 99;
       throw e;
@@ -265,7 +293,9 @@ async function attemptOnce() {
     killPort(PORT); // belt-and-suspenders
 
     // Clean up temp Chrome profile (best-effort)
-    try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    if (userDataDir) {
+      try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
   }
 }
 

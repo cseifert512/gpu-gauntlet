@@ -332,6 +332,99 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 `;
 
+// ── Scalar operations (keep alpha/beta/rz on GPU, avoid CPU readback) ──
+
+export const scalarDivSource = /* wgsl */ `
+// scalar_div.wgsl - c[0] = a[0] / b[0]
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    let denom = b[0];
+    if (abs(denom) < 1e-30) {
+        c[0] = 0.0;
+    } else {
+        c[0] = a[0] / denom;
+    }
+}
+`;
+
+export const scalarNegDivSource = /* wgsl */ `
+// scalar_neg_div.wgsl - c[0] = -(a[0] / b[0])
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    let denom = b[0];
+    if (abs(denom) < 1e-30) {
+        c[0] = 0.0;
+    } else {
+        c[0] = -(a[0] / denom);
+    }
+}
+`;
+
+export const axpyBufSource = /* wgsl */ `
+// axpy_buf.wgsl - y[i] += alpha[0] * x[i], alpha read from buffer
+struct Params {
+    n: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<storage, read> alpha: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < params.n) {
+        y[i] = y[i] + alpha[0] * x[i];
+    }
+}
+`;
+
+export const updatePBufSource = /* wgsl */ `
+// update_p_buf.wgsl - p[i] = z[i] + beta[0] * p[i], beta read from buffer
+struct Params {
+    n: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+
+@group(0) @binding(0) var<storage, read> z: array<f32>;
+@group(0) @binding(1) var<storage, read_write> p: array<f32>;
+@group(0) @binding(2) var<storage, read> beta: array<f32>;
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i < params.n) {
+        p[i] = z[i] + beta[0] * p[i];
+    }
+}
+`;
+
+export const copyScalarSource = /* wgsl */ `
+// copy_scalar.wgsl - dst[0] = src[0]
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+
+@compute @workgroup_size(1)
+fn main() {
+    dst[0] = src[0];
+}
+`;
+
 // Import the larger apply_k shaders from separate files (they're too large to inline comfortably)
 import { applyKQ4Source } from './apply_k_q4_source';
 import { applyKDKTSource } from './apply_k_dkt_source';

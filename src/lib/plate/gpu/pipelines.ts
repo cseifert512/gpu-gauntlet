@@ -21,6 +21,11 @@ import {
   applyKDKTSource,
   applyBCSource,
   zeroBufferSource,
+  scalarDivSource,
+  scalarNegDivSource,
+  axpyBufSource,
+  updatePBufSource,
+  copyScalarSource,
 } from './shaders';
 
 /**
@@ -39,6 +44,12 @@ export interface PlatePipelines {
   applyKDKT: GPUComputePipeline;
   applyBC: GPUComputePipeline;
   zeroBuffer: GPUComputePipeline;
+  // Scalar ops (keep alpha/beta/rz on GPU — eliminates CPU-GPU round-trips)
+  scalarDiv: GPUComputePipeline;
+  scalarNegDiv: GPUComputePipeline;
+  axpyBuf: GPUComputePipeline;
+  updatePBuf: GPUComputePipeline;
+  copyScalar: GPUComputePipeline;
 }
 
 /**
@@ -80,6 +91,11 @@ export async function createPipelines(ctx: GPUContext): Promise<PlatePipelines> 
     applyKDKT,
     applyBC,
     zeroBuffer,
+    scalarDiv,
+    scalarNegDiv,
+    axpyBuf,
+    updatePBuf,
+    copyScalar,
   ] = await Promise.all([
     createPipeline(dotProductSource, 'dot_product'),
     createPipeline(reduceSumSource, 'reduce_sum'),
@@ -93,6 +109,11 @@ export async function createPipelines(ctx: GPUContext): Promise<PlatePipelines> 
     createPipeline(applyKDKTSource, 'apply_k_dkt'),
     createPipeline(applyBCSource, 'apply_bc'),
     createPipeline(zeroBufferSource, 'zero_buffer'),
+    createPipeline(scalarDivSource, 'scalar_div'),
+    createPipeline(scalarNegDivSource, 'scalar_neg_div'),
+    createPipeline(axpyBufSource, 'axpy_buf'),
+    createPipeline(updatePBufSource, 'update_p_buf'),
+    createPipeline(copyScalarSource, 'copy_scalar'),
   ]);
 
   return {
@@ -108,6 +129,11 @@ export async function createPipelines(ctx: GPUContext): Promise<PlatePipelines> 
     applyKDKT,
     applyBC,
     zeroBuffer,
+    scalarDiv,
+    scalarNegDiv,
+    axpyBuf,
+    updatePBuf,
+    copyScalar,
   };
 }
 

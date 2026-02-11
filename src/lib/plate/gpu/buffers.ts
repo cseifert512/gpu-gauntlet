@@ -45,6 +45,15 @@ export interface PlateGPUBuffers {
   stagingX: GPUBuffer; // For reading solution back to CPU
   stagingDot: GPUBuffer; // For reading dot products
 
+  // Scalar buffers (for GPU-only PCG — avoid CPU readbacks)
+  rzBuf: GPUBuffer;      // r·z (current)
+  rzNewBuf: GPUBuffer;   // r·z (next iteration)
+  pApBuf: GPUBuffer;     // p·Ap
+  alphaBuf: GPUBuffer;   // alpha = rz / pAp
+  negAlphaBuf: GPUBuffer; // -alpha = -(rz / pAp)
+  betaBuf: GPUBuffer;    // beta = rz_new / rz
+  rrBuf: GPUBuffer;      // r·r (for convergence check)
+
   // Metadata (not GPU buffers)
   nodeCount: number;
   elementCount: number;
@@ -266,6 +275,16 @@ export function createPlateBuffers(
     'stagingDot'
   );
 
+  // Scalar GPU buffers for batched PCG (no CPU readback needed)
+  const scalarUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+  const rzBuf = createEmptyBuffer(device, 4, scalarUsage, 'rzBuf');
+  const rzNewBuf = createEmptyBuffer(device, 4, scalarUsage, 'rzNewBuf');
+  const pApBuf = createEmptyBuffer(device, 4, scalarUsage, 'pApBuf');
+  const alphaBuf = createEmptyBuffer(device, 4, scalarUsage, 'alphaBuf');
+  const negAlphaBuf = createEmptyBuffer(device, 4, scalarUsage, 'negAlphaBuf');
+  const betaBuf = createEmptyBuffer(device, 4, scalarUsage, 'betaBuf');
+  const rrBuf = createEmptyBuffer(device, 4, scalarUsage, 'rrBuf');
+
   return {
     nodes,
     elements,
@@ -285,6 +304,13 @@ export function createPlateBuffers(
     dotResult,
     stagingX,
     stagingDot,
+    rzBuf,
+    rzNewBuf,
+    pApBuf,
+    alphaBuf,
+    negAlphaBuf,
+    betaBuf,
+    rrBuf,
     nodeCount: mesh.nodeCount,
     elementCount: mesh.elementCount,
     dofCount,
@@ -354,6 +380,13 @@ export function destroyPlateBuffers(buffers: PlateGPUBuffers): void {
     'dotResult',
     'stagingX',
     'stagingDot',
+    'rzBuf',
+    'rzNewBuf',
+    'pApBuf',
+    'alphaBuf',
+    'negAlphaBuf',
+    'betaBuf',
+    'rrBuf',
   ];
 
   for (const key of bufferKeys) {

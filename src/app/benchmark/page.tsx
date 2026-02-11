@@ -17,11 +17,12 @@ interface BenchmarkResult {
 }
 
 // Test configurations
+// meshSize formula for quad mesh: DOF ≈ ((width/meshSize)+1)² × 3
 const TEST_CONFIGS = [
-  { name: 'Small (1k DOF)', meshSize: 2.0, expectedDOF: 1000 },
-  { name: 'Medium (10k DOF)', meshSize: 0.7, expectedDOF: 10000 },
-  { name: 'Large (30k DOF)', meshSize: 0.4, expectedDOF: 30000 },
-  { name: 'Target (60k DOF)', meshSize: 0.28, expectedDOF: 60000 },
+  { name: 'Small (1k DOF)', meshSize: 1.8, expectedDOF: 1000 },
+  { name: 'Medium (10k DOF)', meshSize: 0.55, expectedDOF: 10000 },
+  { name: 'Large (30k DOF)', meshSize: 0.32, expectedDOF: 30000 },
+  { name: 'Target (61k DOF)', meshSize: 0.07, expectedDOF: 61000 },
 ];
 
 export default function BenchmarkPage() {
@@ -88,10 +89,21 @@ export default function BenchmarkPage() {
       // Small delay to ensure React is fully settled
       const t = setTimeout(() => {
         document.getElementById('run-benchmark-btn')?.click();
-      }, 500);
+      }, 800);
       return () => clearTimeout(t);
     }
   }, [gpuSupported, isRunning]);
+
+  // Determine which configs to run based on URL
+  const getConfigsToRun = () => {
+    if (typeof window === 'undefined') return TEST_CONFIGS;
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('target')) {
+      // Only run the target config (for CI / overnight)
+      return [TEST_CONFIGS[TEST_CONFIGS.length - 1]];
+    }
+    return TEST_CONFIGS;
+  };
 
   const runBenchmark = useCallback(async () => {
     if (!gpuSupported) {
@@ -126,7 +138,8 @@ export default function BenchmarkPage() {
       const supports = [{ type: 'pinned' as const, location: 'all_edges' as const }];
       const loads = [{ position: [5, 5] as [number, number], magnitude: 1000 }]; // 1kN center load
 
-      for (const config of TEST_CONFIGS) {
+      const configsToRun = getConfigsToRun();
+      for (const config of configsToRun) {
         setCurrentTest(config.name);
         
         // Generate geometry
@@ -171,9 +184,10 @@ export default function BenchmarkPage() {
           const gpuStart = performance.now();
           const gpuResult = await solveGPU(mesh, material, coloring, F, constrainedDOFs, {
             tolerance: 1e-6,
-            maxIterations: 1000,
+            maxIterations: 2000,
           });
           gpuTimeMs = performance.now() - gpuStart;
+          console.log(`DEBUG: GPU converged=${gpuResult.converged} iters=${gpuResult.iterations} finalResidual=${gpuResult.finalResidual.toExponential(4)} usedGPU=${gpuResult.usedGPU}`);
           
           // Find max displacement (GPU) - extract w from full solution
           const gpuSolution = gpuResult.solution;
@@ -213,6 +227,7 @@ export default function BenchmarkPage() {
         const validStr = validationPassed ? 'PASS' : 'FAIL';
         if (gpuTimeMs > 0) {
           console.log(`DOF: ${actualDOF} | CPU: ${cpuTimeMs.toFixed(1)}ms | GPU: ${gpuTimeMs.toFixed(1)}ms | Valid: ${validStr}`);
+          console.log(`DEBUG: maxW_CPU=${cpuMaxW.toExponential(8)} maxW_GPU=${gpuMaxW.toExponential(8)} relError=${(relativeError * 100).toFixed(6)}% gpuIters=${gpuIterations}`);
         } else {
           console.log(`DOF: ${actualDOF} | CPU: ${cpuTimeMs.toFixed(1)}ms | GPU: FAILED | Valid: FAIL`);
         }
