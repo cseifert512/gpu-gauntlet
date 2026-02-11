@@ -45,8 +45,10 @@ A 100,000 DOF problem has ~33,500 nodes, organized on a structured quad mesh.
 | Typical mesh size | 0.5m grid spacing |
 | DOF range | 1,000–100,000+ |
 | Element types | Q4 (Mindlin quad), DKT (Kirchhoff triangle) |
+| Supports | Point (pinned/fixed/roller), line (polyline), all-edges |
 | Solver | Preconditioned Conjugate Gradient (PCG) |
 | Preconditioner | Block Jacobi (3×3 per node) |
+| Post-processing | GPU moments (Mx, My, Mxy), isocurves |
 | Target solve time | < 20ms |
 
 ---
@@ -105,6 +107,23 @@ Constrained DOFs (from pinned/fixed supports) are handled by:
 3. After K·p, overwriting constrained entries: `Ap[i] = p[i]` for constrained DOFs
 
 This maintains the matrix structure without modifying K explicitly.
+
+### Line Supports
+
+Line supports (`PlateLineSupport`) allow constraints along polylines (walls, beams, etc.) rather than only at discrete nodes. The `resolveLineSupports()` function converts polyline definitions to point supports by:
+
+1. For each segment of the polyline, compute a bounding box expanded by tolerance
+2. For each mesh node within the bounding box, compute point-to-segment distance
+3. Nodes within tolerance become point supports with the same constraint type
+
+```typescript
+const lineSupports: PlateLineSupport[] = [
+  { type: 'pinned', points: [[0, 5], [10, 5]], tolerance: 0.15 },
+  { type: 'fixed', points: [[5, 0], [5, 10]] },  // tolerance defaults to meshSize/4
+];
+const resolved = resolveLineSupports(mesh, lineSupports);
+const allSupports = [...pointSupports, ...resolved];
+```
 
 ### Flexural Rigidity
 
@@ -192,18 +211,36 @@ This separation ensures we measure pure compute time, not initialization overhea
 ### File Structure
 
 ```
-gpu/
-├── context.ts     # WebGPU adapter/device management, caching
-├── buffers.ts     # All GPU buffer definitions and allocation
-├── pipelines.ts   # Compute pipeline creation, GPUDispatcher utility
-├── solver.ts      # Core solver: prepareGPUSolver, executeGPU, solveGPU
-├── fallback.ts    # CPU fallback solver (used when GPU unavailable)
-├── csr.ts         # CSR matrix builder (experimental, not used in hot path)
-├── index.ts       # Public exports
-└── shaders/
-    ├── index.ts              # All WGSL sources as template strings
-    ├── apply_k_q4_source.ts  # Q4 element K·p shader (~300 lines)
-    └── apply_k_dkt_source.ts # DKT element K·p shader (~250 lines)
+plate/
+├── analyzer.ts             # PlateAnalyzer integration class (high-level API)
+├── types.ts                # Core type definitions (geometry, material, mesh, supports)
+├── mesher.ts               # Structured quad mesh generation
+├── mesher-unstructured.ts  # Unstructured CDT triangulation (poly2tri)
+├── mesher-utils.ts         # Geometry helpers (bounding box, winding, point-in-polygon)
+├── coloring.ts             # Element coloring (checkerboard & greedy)
+├── element.ts              # Element stiffness (Q4 Mindlin, DKT Kirchhoff)
+├── solver.ts               # CPU reference solver (DO NOT MODIFY)
+├── pcg.ts                  # PCG algorithm (CPU)
+├── postprocess.ts          # Moment computation (CPU fallback)
+├── line-supports.ts        # Line support → point support resolution
+├── isocurves.ts            # Contour line generation (marching squares)
+├── index.ts                # Public exports
+└── gpu/
+    ├── context.ts           # WebGPU adapter/device management, caching
+    ├── buffers.ts           # All GPU buffer definitions and allocation
+    ├── pipelines.ts         # Compute pipeline creation, GPUDispatcher utility
+    ├── solver.ts            # Core: prepareGPUSolver, executeGPU, solveGPU
+    ├── fallback.ts          # CPU fallback solver (used when GPU unavailable)
+    ├── csr.ts               # CSR matrix builder (experimental)
+    ├── index.ts             # Public exports
+    └── shaders/
+        ├── index.ts                      # All WGSL sources as template strings
+        ├── apply_k_q4_source.ts          # Q4 element K·p shader
+        ├── apply_k_dkt_source.ts         # DKT element K·p shader
+        ├── compute_moments_q4_source.ts  # Q4 moment computation shader
+        ├── compute_moments_dkt_source.ts # DKT moment computation shader
+        ├── average_moments_source.ts     # Nodal moment averaging shader
+        └── (WGSL files for PCG ops)
 ```
 
 ### GPU Buffer Layout
@@ -222,7 +259,12 @@ All solver vectors use `Float32Array` (WebGPU limitation). Key buffers:
 | `blockDiagInv` | nodeCount × 36 | STORAGE | Inverted 3×3 blocks |
 | `constrainedMask` | dofCount × 4 | STORAGE | BC mask (1=constrained) |
 | `rzBuf`, `pApBuf`, etc. | 4 bytes each | STORAGE | GPU-resident scalars |
+| `rrBuf` | 4 bytes | STORAGE | r·r for residual readback |
+| `momentMx/My/Mxy` | nodeCount × 4 each | STORAGE + COPY_SRC/DST | Moment accumulators |
+| `momentCount` | nodeCount × 4 | STORAGE + COPY_SRC/DST | Element count per node |
 | `stagingX` | dofCount × 4 | MAP_READ + COPY_DST | Solution readback |
+| `stagingMoments` | nodeCount × 12 | MAP_READ + COPY_DST | Moment readback (Mx+My+Mxy) |
+| `stagingDot` | 4 bytes | MAP_READ + COPY_DST | Residual norm readback |
 
 ### GPU Pipeline Inventory
 
@@ -240,17 +282,23 @@ All solver vectors use `Float32Array` (WebGPU limitation). Key buffers:
 | `copyScalar` | copy_scalar | 1 | dst[0] = src[0] |
 | `zeroBuffer` | zero_buffer | 256 | Fill buffer with zeros |
 | `copy` | copy | 256 | dst = src (vector) |
+| `computeMomentsQ4` | compute_moments_q4 | 64 | Q4 moment accumulation (per color) |
+| `computeMomentsDKT` | compute_moments_dkt | 64 | DKT moment accumulation (per color) |
+| `averageMoments` | average_moments | 256 | Divide moment sums by count |
 
 ### Execution Flow
 
 ```
 prepareGPUSolver():
-  ┌─ Create/cache pipelines (22 compute pipelines, all parallel)
-  ├─ Allocate all GPU buffers
+  ┌─ Create/cache pipelines (25 compute pipelines, all parallel)
+  ├─ Allocate all GPU buffers (solver vectors + moment accumulators + staging)
   ├─ Upload mesh data (nodes, elements, coloring, material)
   ├─ Upload preconditioner (block diagonal inverse)
   ├─ Create immutable uniform buffers (dofCount, nodeCount, color params)
-  ├─ Pre-create ALL bind groups (reused every iteration)
+  ├─ Pre-create ALL bind groups:
+  │   ├─ PCG bind groups (reused every iteration)
+  │   ├─ Moment computation bind groups (per-color + averaging)
+  │   └─ Residual readback bind group (r·r)
   └─ GPU warm-up dispatch (forces pipeline scheduling to be "hot")
 
 executeGPU() [TIMED]:
@@ -276,15 +324,24 @@ executeGPU() [TIMED]:
   │  │      p = z + β·p (updatePBuf)                                │
   │  │      rz = rzNew (copyScalar)                                 │
   │  │                                                               │
+  │  │  rr = r·r (dotSingle → residual norm)                        │
+  │  │                                                               │
+  │  │  if computeMoments:                                           │
+  │  │      Zero Mx, My, Mxy, count buffers                         │
+  │  │      Per-color moment accumulation (N color dispatches)       │
+  │  │      Average moments (divide sums by count)                   │
+  │  │                                                               │
   │  │  copyBufferToBuffer: x → stagingX                            │
+  │  │  copyBufferToBuffer: rrBuf → stagingDot                      │
+  │  │  copyBufferToBuffer: Mx,My,Mxy → stagingMoments (if moments) │
   │  └──────────────────────────────────────────────────────────────┘
   │
   ├─ queue.submit([encoder.finish()])       // SINGLE SUBMIT
-  ├─ stagingX.mapAsync(READ)                // Wait for GPU completion
-  └─ Read solution from staging buffer
+  ├─ Promise.all(mapAsync for all staging buffers)
+  └─ Read solution, residual norm, and moments from staging
 ```
 
-**Critical insight**: The entire PCG computation — initialization, all 25 iterations, and the final buffer copy — is encoded into **one command buffer** and submitted with **one `queue.submit()` call**. This eliminates all inter-iteration GPU scheduling overhead.
+**Critical insight**: The entire PCG computation — initialization, all 25 iterations, residual norm, optional moment computation, and all staging copies — is encoded into **one command buffer** and submitted with **one `queue.submit()` call**. This eliminates all inter-iteration GPU scheduling overhead. Moments are computed on the GPU with zero additional CPU-GPU round-trips.
 
 ---
 
@@ -440,6 +497,21 @@ One thread per node. Loads the 3×3 inverted block and the 3 residual DOFs, perf
 
 Standard AXPY `y += α·x`, but α is read from a GPU storage buffer rather than a uniform. This allows α to be computed on the GPU without CPU readback.
 
+### compute_moments_q4 / compute_moments_dkt (GPU Moment Computation)
+
+Computes bending moments (Mx, My, Mxy) on the GPU, eliminating the CPU post-processing bottleneck. For each element:
+1. Read node coordinates and solved displacements (θx, θy per node)
+2. Compute shape function derivatives (Jacobian at centroid for Q4, constant for DKT)
+3. Compute curvatures: κx = ∂θy/∂x, κy = -∂θx/∂y, κxy = ∂θy/∂y - ∂θx/∂x
+4. Compute moments via constitutive relation: Mx = D(κx + νκy), etc.
+5. Atomic-add moments and increment count at each element node
+
+Dispatched per color (same coloring as K·p) to avoid write conflicts. Workgroup size: 64.
+
+### average_moments (Nodal Averaging)
+
+Divides accumulated moment sums by the number of contributing elements at each node. One thread per node, workgroup size 256. Produces the final smoothed moment fields ready for visualization.
+
 ---
 
 ## Validation Methodology
@@ -491,21 +563,97 @@ Every `bench:ci` run validates:
 
 ```bash
 npm install puppeteer-core wait-on  # Only for automated benchmarking
+npm install poly2tri                # Only if using unstructured mesh generation
 # The solver itself has zero runtime dependencies beyond WebGPU
 ```
 
 ### Step 1: Copy the Solver Module
 
-Copy the entire `src/lib/plate/` directory into your project. The module is self-contained with no external dependencies.
+Copy the entire `src/lib/plate/` directory into your project. The module is self-contained.
 
-### Step 2: Import the Public API
+### Step 2: High-Level API — PlateAnalyzer (Recommended)
+
+The `PlateAnalyzer` class manages the full lifecycle of mesh generation, GPU resources, solving, post-processing, and visualization. This is the recommended integration path:
 
 ```typescript
-// Types
+import {
+  PlateAnalyzer,
+} from '@/lib/plate';
+import type {
+  PlateGeometry,
+  PlateMaterial,
+  PlateSupport,
+  PlateLineSupport,
+  PlateLoad,
+} from '@/lib/plate';
+
+// Create analyzer
+const analyzer = new PlateAnalyzer();
+
+// Define problem
+const geometry: PlateGeometry = {
+  boundary: new Float32Array([0, 0, 10, 0, 10, 10, 0, 10]),
+  holes: [],
+};
+
+const material: PlateMaterial = { E: 30e9, nu: 0.2, t: 0.2 };
+
+const pointSupports: PlateSupport[] = [
+  { type: 'pinned', location: 'all_edges' },
+];
+
+const lineSupports: PlateLineSupport[] = [
+  { type: 'pinned', points: [[5, 0], [5, 10]] },  // Internal wall support
+];
+
+// === SETUP (once per geometry change, ~50ms) ===
+await analyzer.setup(geometry, material, pointSupports, lineSupports, {
+  meshSize: 0.5,       // 0.5m grid → ~1,200 nodes for 10×10m plate
+  maxIterations: 25,
+  gpuMoments: true,     // Compute moments on GPU (same command buffer)
+});
+
+console.log(`Mesh: ${analyzer.dofCount} DOF`);
+
+// === SOLVE (per load case, ~13ms for 100k DOF) ===
+const loads: PlateLoad[] = [
+  { position: [5, 5], magnitude: -10000 },
+];
+
+const result = await analyzer.solve(loads);
+
+// Result includes everything:
+console.log(`Max deflection: ${result.maxDeflection} m`);
+console.log(`Max Mx: ${result.maxMx} N·m/m`);
+console.log(`Solve time: ${result.solveTimeMs.toFixed(1)} ms`);
+console.log(`Residual norm: ${result.residualNorm.toExponential(2)}`);
+console.log(`Used GPU: ${result.usedGPU}`);
+
+// === ISOCURVES (for visualization, <2ms) ===
+const deflectionContours = analyzer.getIsocurves(result.w, { levels: 15 });
+const momentContours = analyzer.getIsocurves(result.Mx, { levels: 20 });
+
+for (const level of deflectionContours) {
+  // level.value — the iso-value
+  // level.segments — raw line segments
+  // level.polylines — chained Float32Array polylines [x0,y0, x1,y1, ...]
+  drawPolylines(level.polylines, level.value);
+}
+
+// === CLEANUP ===
+analyzer.destroy();
+```
+
+### Step 3: Low-Level API (Advanced Control)
+
+For cases where you need fine-grained control over the pipeline:
+
+```typescript
 import type {
   PlateMaterial,
   PlateGeometry,
   PlateSupport,
+  PlateLineSupport,
   PlateLoad,
   PlateMesh,
   PlateResult,
@@ -523,59 +671,44 @@ import {
 } from '@/lib/plate/gpu';
 import type { GPUSolverContext, GPUSolveResult } from '@/lib/plate/gpu';
 
-// Mesh utilities (needed for GPU solve setup)
+// Mesh utilities
 import {
+  generateMesh,
   computeElementColoring,
   identifyConstrainedDOFs,
   computeBlockDiagonal,
   invertBlockDiagonal,
   buildLoadVector,
   applyBCsToRHS,
+  resolveLineSupports,
+  mergeSupports,
+  extractVerticalDisplacements,
+  computeMoments,
+  generateIsocurves,
 } from '@/lib/plate';
 ```
 
-### Step 3: CPU-Only Path (Simplest)
+#### GPU-Accelerated Solve (Manual Setup)
 
 ```typescript
-const result = solvePlate(geometry, material, supports, loads, {
-  meshSize: 0.5,
-  tolerance: 1e-6,
-  maxIterations: 1000,
-});
-
-// result.w = vertical displacements (Float32Array)
-// result.Mx, result.My, result.Mxy = bending moments
-// result.solverInfo = timing and convergence info
-```
-
-### Step 4: GPU-Accelerated Path (Real-Time)
-
-```typescript
-// === SETUP PHASE (done once per geometry change) ===
-
 // Generate mesh
-const mesh = solvePlate(geometry, material, supports, loads, {
-  meshSize: 0.055,  // ~100k DOF
-}).mesh;
+const mesh = generateMesh(geometry, 0.055);  // ~100k DOF
 
-// Or use mesh generation directly:
-// const mesh = generateRectangularMesh(geometry, 0.055);
+// Resolve line supports
+const allSupports = mergeSupports(mesh, pointSupports, lineSupports);
 
+// Setup
 const coloring = computeElementColoring(mesh);
-const constrainedDOFs = identifyConstrainedDOFs(mesh, supports);
-
-// Pre-compute preconditioner
+const constrainedDOFs = identifyConstrainedDOFs(mesh, allSupports);
 const blockDiag = computeBlockDiagonal(mesh, material);
 invertBlockDiagonal(blockDiag, constrainedDOFs);
 
-// Pre-create GPU resources (takes ~50ms, but only done once)
+// Pre-create GPU resources (~50ms, done once)
 const gpuCtx = await prepareGPUSolver(
   mesh, material, coloring, constrainedDOFs, blockDiag
 );
 
-// === SOLVE PHASE (done per load case, ~13ms) ===
-
-// Build load vector for current loads
+// Solve (~13ms per load case)
 const F = buildLoadVector(mesh, loads);
 applyBCsToRHS(F, constrainedDOFs);
 
@@ -583,102 +716,26 @@ const result = await solveGPU(mesh, material, coloring, F, constrainedDOFs, {
   maxIterations: 25,
   preparedContext: gpuCtx,
   precomputedBlockDiagInv: blockDiag,
+  computeMoments: true,  // GPU-computed moments in same command buffer
 });
 
-// result.solution: Float32Array [w0,θx0,θy0, w1,θx1,θy1, ...]
-// result.gpuTimeMs: solve time in ms
-// result.usedGPU: true if GPU was used
+// result.solution — full DOF vector
+// result.Mx, result.My, result.Mxy — GPU-computed moments (if computeMoments: true)
+// result.finalResidual — ||r||₂ after last iteration
+// result.gpuTimeMs — wall-clock solve time
+// result.usedGPU — true if GPU was used
 
-// === CLEANUP (when geometry changes or component unmounts) ===
+// CPU fallback for moments (if GPU moments not requested)
+if (!result.Mx) {
+  const moments = computeMoments(mesh, result.solution, material);
+}
+
+// Isocurves
+const w = extractVerticalDisplacements(result.solution, mesh.nodeCount);
+const contours = generateIsocurves(mesh, w, { levels: 20 });
+
+// Cleanup
 destroyGPUSolverContext(gpuCtx);
-```
-
-### Step 5: Real-Time Interactive Use
-
-For an interactive application where loads change but geometry stays fixed:
-
-```typescript
-class PlateAnalyzer {
-  private gpuCtx: GPUSolverContext | null = null;
-  private mesh: PlateMesh;
-  private coloring: ElementColoring;
-  private constrainedDOFs: Set<number>;
-  private blockDiag: Float32Array;
-
-  async setupGeometry(geometry, material, supports) {
-    // Cleanup previous
-    if (this.gpuCtx) destroyGPUSolverContext(this.gpuCtx);
-
-    // Generate mesh and prepare GPU
-    const cpuResult = solvePlate(geometry, material, supports, [], {
-      meshSize: 0.055,
-    });
-    this.mesh = cpuResult.mesh;
-    this.coloring = computeElementColoring(this.mesh);
-    this.constrainedDOFs = identifyConstrainedDOFs(this.mesh, supports);
-    this.blockDiag = computeBlockDiagonal(this.mesh, material);
-    invertBlockDiagonal(this.blockDiag, this.constrainedDOFs);
-    this.gpuCtx = await prepareGPUSolver(
-      this.mesh, material, this.coloring, this.constrainedDOFs, this.blockDiag
-    );
-  }
-
-  async solve(loads: PlateLoad[]): Promise<GPUSolveResult> {
-    const F = buildLoadVector(this.mesh, loads);
-    applyBCsToRHS(F, this.constrainedDOFs);
-
-    return solveGPU(
-      this.mesh, this.mesh.material, this.coloring, F,
-      this.constrainedDOFs,
-      {
-        maxIterations: 25,
-        preparedContext: this.gpuCtx,
-        precomputedBlockDiagInv: this.blockDiag,
-      }
-    );
-  }
-
-  destroy() {
-    if (this.gpuCtx) destroyGPUSolverContext(this.gpuCtx);
-  }
-}
-
-// Usage:
-const analyzer = new PlateAnalyzer();
-await analyzer.setupGeometry(geometry, material, supports);
-
-// On each user interaction (drag load, change position, etc.):
-const result = await analyzer.solve(currentLoads);
-// → ~13ms, suitable for 60fps interaction
-```
-
-### Step 6: Extract Results
-
-```typescript
-// Vertical displacements (one per node)
-const w = new Float32Array(mesh.nodeCount);
-for (let i = 0; i < mesh.nodeCount; i++) {
-  w[i] = result.solution[i * 3];  // w is DOF index 0 per node
-}
-
-// Rotations
-const thetaX = new Float32Array(mesh.nodeCount);
-const thetaY = new Float32Array(mesh.nodeCount);
-for (let i = 0; i < mesh.nodeCount; i++) {
-  thetaX[i] = result.solution[i * 3 + 1];
-  thetaY[i] = result.solution[i * 3 + 2];
-}
-
-// Maximum displacement
-let maxW = 0;
-for (let i = 0; i < w.length; i++) {
-  if (Math.abs(w[i]) > Math.abs(maxW)) maxW = w[i];
-}
-
-// For bending moments, use the CPU postprocessor:
-import { computeMoments } from '@/lib/plate';
-const moments = computeMoments(mesh, material, result.solution);
-// moments.Mx, moments.My, moments.Mxy
 ```
 
 ### Graceful Fallback
@@ -800,13 +857,24 @@ The scaling is approximately linear in DOF count, which is expected since K·p i
 
 1. **Float32 precision**: GPU operates in 32-bit. For very large or ill-conditioned problems, the 25-iteration solution may diverge from the CPU reference by more than 5%.
 
-2. **No convergence check**: The solver runs a fixed iteration count. Adding an early-exit check would require a CPU readback (one `mapAsync` per check interval), adding ~2ms per check.
+2. **Fixed iteration count**: The solver runs a fixed iteration count for maximum throughput. The final residual norm is read back after the solve completes (zero-cost, in the same command buffer), but there is no early exit. Adding mid-solve convergence checks would require CPU readbacks (~2ms per check).
 
-3. **Structured meshes only**: The current K·p shader assumes either all-Q4 or all-DKT elements. Mixed meshes are not supported.
+3. **Homogeneous elements only**: The current K·p shader assumes either all-Q4 or all-DKT elements. Mixed meshes are not supported.
 
 4. **Single-workgroup dot product**: The `dotSingle` shader uses 1 workgroup of 256 threads. For DOF > ~200k, a multi-workgroup approach with a reduce step would be needed.
 
 5. **No GPU timestamp queries**: WebGPU's `timestamp-query` feature is not widely available. GPU time is measured via `performance.now()` around submit+mapAsync, which includes CPU overhead.
+
+### Recently Implemented
+
+These were identified as gaps and have been addressed:
+
+- ✅ **Line supports**: `PlateLineSupport` type with polyline-to-mesh-node resolution (`line-supports.ts`)
+- ✅ **GPU moment computation**: Mx, My, Mxy computed on GPU in the same command buffer as the PCG solve (3 new shaders)
+- ✅ **Isocurve generation**: Contour line extraction for any nodal scalar field (`isocurves.ts`)
+- ✅ **GPU residual readback**: Final ||r||₂ computed and returned with zero additional overhead
+- ✅ **PlateAnalyzer class**: High-level integration API managing full lifecycle (`analyzer.ts`)
+- ✅ **Unstructured mesh support**: DKT elements with greedy coloring for triangulated geometries
 
 ### Potential Improvements
 
@@ -820,7 +888,9 @@ The scaling is approximately linear in DOF count, which is expected since K·p i
 
 5. **Texture memory**: Store element stiffness matrices in texture memory for better cache behavior.
 
-6. **Unstructured mesh support**: Greedy coloring instead of checkerboard for triangulated geometries.
+6. **UDL (uniformly distributed loads)**: Currently only point loads are supported; distributed loads would require element-level integration into the load vector.
+
+7. **Adaptive mesh refinement**: Refine mesh locally in high-gradient regions for efficiency.
 
 ---
 

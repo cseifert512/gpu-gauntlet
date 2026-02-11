@@ -21,6 +21,7 @@ export type {
   PlateMaterial,
   PlateGeometry,
   PlateSupport,
+  PlateLineSupport,
   SupportType,
   PlateLoad,
   PlateUDL,
@@ -105,6 +106,24 @@ export {
   axpy,
 } from './pcg';
 
+// Line support resolution
+export {
+  findNodesOnPolyline,
+  resolveLineSupports,
+  mergeSupports,
+} from './line-supports';
+
+// Isocurve / contour generation
+export {
+  generateIsocurves,
+  computeIsoValues,
+} from './isocurves';
+export type {
+  ContourSegment,
+  ContourLevel,
+  IsocurveOptions,
+} from './isocurves';
+
 // Post-processing
 export {
   computeMoments,
@@ -118,4 +137,8 @@ export {
   solveGPU,
   isWebGPUAvailable,
 } from './gpu';
+
+// High-level integration class
+export { PlateAnalyzer } from './analyzer';
+export type { AnalyzerSetupOptions, AnalysisResult } from './analyzer';
 

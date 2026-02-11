@@ -54,6 +54,13 @@ export interface PlateGPUBuffers {
   betaBuf: GPUBuffer;    // beta = rz_new / rz
   rrBuf: GPUBuffer;      // r·r (for convergence check)
 
+  // Moment computation buffers (GPU post-processing)
+  momentMx: GPUBuffer;        // Mx accumulator (nodeCount floats)
+  momentMy: GPUBuffer;        // My accumulator (nodeCount floats)
+  momentMxy: GPUBuffer;       // Mxy accumulator (nodeCount floats)
+  momentCount: GPUBuffer;     // Contribution count per node (nodeCount floats)
+  stagingMoments: GPUBuffer;  // For reading moments back to CPU (3 × nodeCount floats)
+
   // Metadata (not GPU buffers)
   nodeCount: number;
   elementCount: number;
@@ -285,6 +292,20 @@ export function createPlateBuffers(
   const betaBuf = createEmptyBuffer(device, 4, scalarUsage, 'betaBuf');
   const rrBuf = createEmptyBuffer(device, 4, scalarUsage, 'rrBuf');
 
+  // Moment computation buffers (GPU post-processing)
+  const nodeSize = mesh.nodeCount * 4; // Float32
+  const momentUsage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+  const momentMx = createEmptyBuffer(device, nodeSize, momentUsage, 'momentMx');
+  const momentMy = createEmptyBuffer(device, nodeSize, momentUsage, 'momentMy');
+  const momentMxy = createEmptyBuffer(device, nodeSize, momentUsage, 'momentMxy');
+  const momentCount = createEmptyBuffer(device, nodeSize, momentUsage, 'momentCount');
+  const stagingMoments = createEmptyBuffer(
+    device,
+    nodeSize * 3, // Mx + My + Mxy
+    GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    'stagingMoments'
+  );
+
   return {
     nodes,
     elements,
@@ -311,6 +332,11 @@ export function createPlateBuffers(
     negAlphaBuf,
     betaBuf,
     rrBuf,
+    momentMx,
+    momentMy,
+    momentMxy,
+    momentCount,
+    stagingMoments,
     nodeCount: mesh.nodeCount,
     elementCount: mesh.elementCount,
     dofCount,
@@ -387,6 +413,11 @@ export function destroyPlateBuffers(buffers: PlateGPUBuffers): void {
     'negAlphaBuf',
     'betaBuf',
     'rrBuf',
+    'momentMx',
+    'momentMy',
+    'momentMxy',
+    'momentCount',
+    'stagingMoments',
   ];
 
   for (const key of bufferKeys) {

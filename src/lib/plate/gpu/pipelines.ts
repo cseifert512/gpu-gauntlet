@@ -31,6 +31,9 @@ import {
   spmvCSRSource,
   applyKPrecomputedQ4Source,
   applyKPrecomputedDKTSource,
+  computeMomentsQ4Source,
+  computeMomentsDKTSource,
+  averageMomentsSource,
 } from './shaders';
 
 /**
@@ -63,6 +66,10 @@ export interface PlatePipelines {
   // Pre-computed Ke K·p (avoids Gauss quadrature in hot loop)
   applyKPrecomputedQ4: GPUComputePipeline;
   applyKPrecomputedDKT: GPUComputePipeline;
+  // GPU moment post-processing
+  computeMomentsQ4: GPUComputePipeline;
+  computeMomentsDKT: GPUComputePipeline;
+  averageMoments: GPUComputePipeline;
 }
 
 /**
@@ -114,6 +121,9 @@ export async function createPipelines(ctx: GPUContext): Promise<PlatePipelines> 
     spmvCSR,
     applyKPrecomputedQ4,
     applyKPrecomputedDKT,
+    computeMomentsQ4,
+    computeMomentsDKT,
+    averageMoments,
   ] = await Promise.all([
     createPipeline(dotProductSource, 'dot_product'),
     createPipeline(reduceSumSource, 'reduce_sum'),
@@ -137,6 +147,9 @@ export async function createPipelines(ctx: GPUContext): Promise<PlatePipelines> 
     createPipeline(spmvCSRSource, 'spmv_csr'),
     createPipeline(applyKPrecomputedQ4Source, 'apply_k_precomputed_q4'),
     createPipeline(applyKPrecomputedDKTSource, 'apply_k_precomputed_dkt'),
+    createPipeline(computeMomentsQ4Source, 'compute_moments_q4'),
+    createPipeline(computeMomentsDKTSource, 'compute_moments_dkt'),
+    createPipeline(averageMomentsSource, 'average_moments'),
   ]);
 
   return {
@@ -162,6 +175,9 @@ export async function createPipelines(ctx: GPUContext): Promise<PlatePipelines> 
     spmvCSR,
     applyKPrecomputedQ4,
     applyKPrecomputedDKT,
+    computeMomentsQ4,
+    computeMomentsDKT,
+    averageMoments,
   };
 }
 

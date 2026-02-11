@@ -50,6 +50,23 @@ export interface PlateSupport {
   location: number | 'all_edges';
 }
 
+/**
+ * Line support — constrains all mesh nodes along a polyline.
+ *
+ * Used for walls, beams, or any linear support condition. The solver finds
+ * all nodes within `tolerance` of the polyline segments and applies the
+ * specified constraint type (pinned / fixed / roller) to each.
+ *
+ * Points are [x, y] pairs describing the polyline vertices.
+ */
+export interface PlateLineSupport {
+  type: SupportType;
+  /** Polyline vertices: [[x0,y0], [x1,y1], ...] (at least 2 points) */
+  points: [number, number][];
+  /** Distance tolerance for snapping nodes to the line (default: meshSize/4) */
+  tolerance?: number;
+}
+
 // =============================================================================
 // Loading
 // =============================================================================

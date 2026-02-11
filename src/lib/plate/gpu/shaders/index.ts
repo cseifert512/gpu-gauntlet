@@ -717,5 +717,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 import { applyKQ4Source } from './apply_k_q4_source';
 import { applyKDKTSource } from './apply_k_dkt_source';
 
+// Moment computation shaders (GPU post-processing)
+import { computeMomentsQ4Source } from './compute_moments_q4_source';
+import { computeMomentsDKTSource } from './compute_moments_dkt_source';
+import { averageMomentsSource } from './average_moments_source';
+
 export { applyKQ4Source, applyKDKTSource };
+export { computeMomentsQ4Source, computeMomentsDKTSource, averageMomentsSource };
 

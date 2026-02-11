@@ -50,6 +50,8 @@ export interface GPUSolverOptions {
   precomputedBlockDiagInv?: Float32Array;
   /** Pre-created GPU solver context (from prepareGPUSolver). */
   preparedContext?: GPUSolverContext;
+  /** Compute moments (Mx, My, Mxy) on GPU in the same command buffer (default: false). */
+  computeMoments?: boolean;
 }
 
 export interface GPUSolveResult {
@@ -59,6 +61,10 @@ export interface GPUSolveResult {
   converged: boolean;
   gpuTimeMs: number;
   usedGPU: boolean;
+  /** GPU-computed moments (if computeMoments option was true) */
+  Mx?: Float32Array;
+  My?: Float32Array;
+  Mxy?: Float32Array;
 }
 
 /** Pre-created GPU resources for fast execution. */
@@ -93,6 +99,12 @@ export interface GPUSolverContext {
   isTriangleMesh: boolean;
   colorCounts: number[];
   kpWgSize: number;
+  // Moment computation bind groups (GPU post-processing)
+  bgZeroMoments: GPUBindGroup[];   // Zero Mx,My,Mxy,count buffers
+  bgMomentColors: GPUBindGroup[];  // Per-color moment accumulation
+  bgAvgMoments: GPUBindGroup;      // Final averaging pass
+  // Residual readback
+  bgDotRR: GPUBindGroup;           // r·r for convergence info
 }
 
 let cachedPipelines: PlatePipelines | null = null;
@@ -319,6 +331,62 @@ export async function prepareGPUSolver(
     ],
   });
 
+  // ── Residual norm bind group (r·r for convergence info) ──
+  const bgDotRR = device.createBindGroup({
+    layout: pipelines.dotSingle.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.r } },
+      { binding: 1, resource: { buffer: buffers.r } },
+      { binding: 2, resource: { buffer: buffers.rrBuf } },
+      { binding: 3, resource: { buffer: paramsDof } },
+    ],
+  });
+
+  // ── Moment computation bind groups ──
+  const momentPipeline = isTriangleMesh ? pipelines.computeMomentsDKT : pipelines.computeMomentsQ4;
+
+  // Zero the 4 moment accumulators (Mx, My, Mxy, count)
+  const bgZeroMoments = [buffers.momentMx, buffers.momentMy, buffers.momentMxy, buffers.momentCount].map(
+    (buf, idx) => device.createBindGroup({
+      layout: pipelines.zeroBuffer.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: buf } },
+        { binding: 1, resource: { buffer: paramsNode } },
+      ],
+    })
+  );
+
+  // Per-color moment accumulation
+  const bgMomentColors = colorParamsBufs.map((cpBuf) =>
+    device.createBindGroup({
+      layout: momentPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: buffers.nodes } },
+        { binding: 1, resource: { buffer: buffers.elements } },
+        { binding: 2, resource: { buffer: buffers.elementsByColor } },
+        { binding: 3, resource: { buffer: buffers.material } },
+        { binding: 4, resource: { buffer: buffers.x } },          // Solved displacements
+        { binding: 5, resource: { buffer: buffers.momentMx } },
+        { binding: 6, resource: { buffer: buffers.momentMy } },
+        { binding: 7, resource: { buffer: buffers.momentMxy } },
+        { binding: 8, resource: { buffer: buffers.momentCount } },
+        { binding: 9, resource: { buffer: cpBuf } },
+      ],
+    })
+  );
+
+  // Averaging pass
+  const bgAvgMoments = device.createBindGroup({
+    layout: pipelines.averageMoments.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: buffers.momentMx } },
+      { binding: 1, resource: { buffer: buffers.momentMy } },
+      { binding: 2, resource: { buffer: buffers.momentMxy } },
+      { binding: 3, resource: { buffer: buffers.momentCount } },
+      { binding: 4, resource: { buffer: paramsNode } },
+    ],
+  });
+
   // ── GPU warm-up: force the GPU pipeline to be "hot" ──
   // Submit a small no-op dispatch and wait for it to complete.
   // This eliminates cold-start scheduling jitter that can add 2-4ms.
@@ -341,6 +409,8 @@ export async function prepareGPUSolver(
     bgDotPAp, bgDotRzNew, bgDotRzInit, bgAlphaPair,
     bgAxpyX, bgAxpyR, bgPrecond, bgBeta, bgUpdateP, bgCopyRz, bgCopyZtoP,
     isTriangleMesh, colorCounts, kpWgSize,
+    bgZeroMoments, bgMomentColors, bgAvgMoments,
+    bgDotRR,
   };
 }
 
@@ -365,6 +435,7 @@ async function executeGPU(
   sctx: GPUSolverContext,
   F: Float32Array,
   maxIterations: number,
+  computeMomentsFlag: boolean = false,
 ): Promise<GPUSolveResult> {
   const { ctx, pipelines, buffers } = sctx;
   const { device } = ctx;
@@ -511,24 +582,103 @@ async function executeGPU(
     pass.end();
   }
 
-  // ── Copy solution to staging IN THE SAME command buffer ──
+  // ── Compute final residual norm r·r (always — near zero cost) ──
+  pass = enc.beginComputePass();
+  pass.setPipeline(pipelines.dotSingle);
+  pass.setBindGroup(0, sctx.bgDotRR);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+
+  // ── Optional: GPU moment computation (same command buffer!) ──
+  if (computeMomentsFlag) {
+    const {
+      bgZeroMoments, bgMomentColors, bgAvgMoments,
+    } = sctx;
+    const momentPipeline = isTriangleMesh ? pipelines.computeMomentsDKT : pipelines.computeMomentsQ4;
+
+    // Zero moment accumulators
+    for (const bg of bgZeroMoments) {
+      pass = enc.beginComputePass();
+      pass.setPipeline(pipelines.zeroBuffer);
+      pass.setBindGroup(0, bg);
+      pass.dispatchWorkgroups(wgNode);
+      pass.end();
+    }
+
+    // Accumulate moments per color (coloring prevents write conflicts)
+    for (let c = 0; c < sctx.coloring.colorCount; c++) {
+      if (colorCounts[c] === 0) continue;
+      pass = enc.beginComputePass();
+      pass.setPipeline(momentPipeline);
+      pass.setBindGroup(0, bgMomentColors[c]);
+      pass.dispatchWorkgroups(Math.ceil(colorCounts[c] / kpWgSize));
+      pass.end();
+    }
+
+    // Average moments
+    pass = enc.beginComputePass();
+    pass.setPipeline(pipelines.averageMoments);
+    pass.setBindGroup(0, bgAvgMoments);
+    pass.dispatchWorkgroups(wgNode);
+    pass.end();
+  }
+
+  // ── Copy solution and residual to staging IN THE SAME command buffer ──
   enc.copyBufferToBuffer(buffers.x, 0, buffers.stagingX, 0, dofCount * 4);
+  enc.copyBufferToBuffer(buffers.rrBuf, 0, buffers.stagingDot, 0, 4);
+
+  // Also copy moments to staging if computed
+  if (computeMomentsFlag) {
+    const momentBytes = nodeCount * 4;
+    enc.copyBufferToBuffer(buffers.momentMx, 0, buffers.stagingMoments, 0, momentBytes);
+    enc.copyBufferToBuffer(buffers.momentMy, 0, buffers.stagingMoments, momentBytes, momentBytes);
+    enc.copyBufferToBuffer(buffers.momentMxy, 0, buffers.stagingMoments, momentBytes * 2, momentBytes);
+  }
 
   // Single submit for everything
   device.queue.submit([enc.finish()]);
 
-  // Map staging buffer (waits for GPU to complete)
-  await buffers.stagingX.mapAsync(GPUMapMode.READ);
+  // Map staging buffers (waits for GPU to complete)
+  // Map solution and residual in parallel
+  const mapPromises: Promise<void>[] = [
+    buffers.stagingX.mapAsync(GPUMapMode.READ),
+    buffers.stagingDot.mapAsync(GPUMapMode.READ),
+  ];
+  if (computeMomentsFlag) {
+    mapPromises.push(buffers.stagingMoments.mapAsync(GPUMapMode.READ));
+  }
+  await Promise.all(mapPromises);
+
   const solution = new Float32Array(buffers.stagingX.getMappedRange().slice(0, dofCount * 4));
   buffers.stagingX.unmap();
+
+  // Read residual norm
+  const rrData = new Float32Array(buffers.stagingDot.getMappedRange().slice(0, 4));
+  const finalResidual = Math.sqrt(Math.abs(rrData[0]));
+  buffers.stagingDot.unmap();
+
+  // Read moments if computed
+  let Mx: Float32Array | undefined;
+  let My: Float32Array | undefined;
+  let Mxy: Float32Array | undefined;
+  if (computeMomentsFlag) {
+    const momData = new Float32Array(buffers.stagingMoments.getMappedRange().slice(0, nodeCount * 3 * 4));
+    buffers.stagingMoments.unmap();
+    Mx = new Float32Array(momData.buffer, 0, nodeCount);
+    My = new Float32Array(momData.buffer, nodeCount * 4, nodeCount);
+    Mxy = new Float32Array(momData.buffer, nodeCount * 8, nodeCount);
+  }
 
   return {
     solution,
     iterations: maxIterations,
-    finalResidual: 0,
-    converged: false,
+    finalResidual,
+    converged: finalResidual < 1e-6,
     gpuTimeMs: performance.now() - startTime,
     usedGPU: true,
+    Mx,
+    My,
+    Mxy,
   };
 }
 
@@ -545,7 +695,7 @@ export async function solveGPU(
   // Fast path: use pre-prepared context
   if (options.preparedContext) {
     try {
-      return await executeGPU(options.preparedContext, F, options.maxIterations ?? 1000);
+      return await executeGPU(options.preparedContext, F, options.maxIterations ?? 1000, options.computeMoments ?? false);
     } catch (e) {
       console.log('DEBUG: GPU execute failed: ' + (e instanceof Error ? e.message : String(e)));
       return solveCPUFallback(mesh, material, coloring, F, constrainedDOFs, options);
@@ -571,7 +721,7 @@ export async function solveGPU(
   }
 
   try {
-    return await executeGPU(sctx, F, options.maxIterations ?? 1000);
+    return await executeGPU(sctx, F, options.maxIterations ?? 1000, options.computeMoments ?? false);
   } catch (e) {
     console.log('DEBUG: GPU solve failed, falling back to CPU: ' + (e instanceof Error ? e.message + '\n' + e.stack : String(e)));
     return solveCPUFallback(mesh, material, coloring, F, constrainedDOFs, options);
