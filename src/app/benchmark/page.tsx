@@ -19,10 +19,11 @@ interface BenchmarkResult {
 // Test configurations
 // meshSize formula for quad mesh: DOF ≈ ((width/meshSize)+1)² × 3
 const TEST_CONFIGS = [
-  { name: 'Small (1k DOF)', meshSize: 1.8, expectedDOF: 1000 },
-  { name: 'Medium (10k DOF)', meshSize: 0.55, expectedDOF: 10000 },
-  { name: 'Large (30k DOF)', meshSize: 0.32, expectedDOF: 30000 },
-  { name: 'Target (61k DOF)', meshSize: 0.07, expectedDOF: 61000 },
+  { name: 'Small (1k DOF)', meshSize: 1.8, expectedDOF: 1000, maxIterations: 25 },
+  { name: 'Medium (10k DOF)', meshSize: 0.55, expectedDOF: 10000, maxIterations: 25 },
+  { name: 'Large (30k DOF)', meshSize: 0.32, expectedDOF: 30000, maxIterations: 25 },
+  { name: 'Target-62k (61k DOF)', meshSize: 0.07, expectedDOF: 61000, maxIterations: 25 },
+  { name: 'Target-100k (100k DOF)', meshSize: 0.055, expectedDOF: 100000, maxIterations: 25 },
 ];
 
 export default function BenchmarkPage() {
@@ -153,7 +154,7 @@ export default function BenchmarkPage() {
         const cpuResult = solvePlate(geometry, material, supports, loads, {
           meshSize: config.meshSize,
           tolerance: 1e-6,
-          maxIterations: 25,
+          maxIterations: config.maxIterations,
         });
         const cpuTimeMs = performance.now() - cpuStart;
 
@@ -194,7 +195,7 @@ export default function BenchmarkPage() {
           const gpuStart = performance.now();
           const gpuResult = await solveGPU(mesh, material, coloring, F, constrainedDOFs, {
             tolerance: 1e-6,
-            maxIterations: 25, // Must match CPU maxIterations for valid comparison
+            maxIterations: config.maxIterations, // Must match CPU maxIterations for valid comparison
             precomputedBlockDiagInv: blockDiag,
             preparedContext: gpuCtx ?? undefined,
           });
@@ -223,7 +224,7 @@ export default function BenchmarkPage() {
           ? Math.abs(gpuMaxW - cpuMaxW) / Math.abs(cpuMaxW)
           : 0;
         const validationPassed = relativeError < 0.05; // 5% — relaxed since PCG may not fully converge
-        const targetMet = gpuTimeMs > 0 && gpuTimeMs < 20 && actualDOF >= 60000;
+        const targetMet = gpuTimeMs > 0 && gpuTimeMs < 20 && actualDOF >= 90000;
 
         const result: BenchmarkResult = {
           dofCount: actualDOF,
@@ -273,7 +274,7 @@ export default function BenchmarkPage() {
     return n.toFixed(6);
   };
 
-  const target60kResult = results.find(r => r.dofCount >= 60000);
+  const target60kResult = results.find(r => r.dofCount >= 90000) ?? results.find(r => r.dofCount >= 60000);
   const challengeWon = target60kResult?.targetMet === true;
 
   return (
@@ -285,7 +286,7 @@ export default function BenchmarkPage() {
         </Link>
         <h1 className="text-4xl font-bold text-white">Benchmark Runner</h1>
         <p className="text-gray-400 mt-2">
-          Test your optimization against the target: 60k DOF in &lt;20ms
+          Test your optimization against the target: 100k DOF in &lt;20ms
         </p>
       </header>
 
@@ -352,7 +353,7 @@ export default function BenchmarkPage() {
                 ) : (
                   <>
                     <h3 className="text-2xl font-bold text-white mb-2">
-                      Target: 60k DOF in &lt;20ms
+                      Target: 100k DOF in &lt;20ms
                     </h3>
                     <p className="text-xl">
                       <span className="text-gray-400">Current: </span>
@@ -389,7 +390,7 @@ export default function BenchmarkPage() {
                     <td className="font-mono">{formatTime(result.cpuTimeMs)}</td>
                     <td className={`font-mono ${
                       result.gpuTimeMs < 0 ? 'text-red-500' :
-                      result.gpuTimeMs < 20 && result.dofCount >= 60000 ? 'text-[var(--color-primary)]' :
+                      result.gpuTimeMs < 20 && result.dofCount >= 90000 ? 'text-[var(--color-primary)]' :
                       'text-white'
                     }`}>
                       {formatTime(result.gpuTimeMs)}
@@ -446,7 +447,7 @@ export default function BenchmarkPage() {
         <h2 className="text-xl font-bold mb-4 text-white">How to Submit</h2>
         <ol className="space-y-2 text-gray-300 list-decimal list-inside">
           <li>Run the benchmark above and verify validation passes</li>
-          <li>If GPU time for 60k DOF is under 20ms, you've won!</li>
+          <li>If GPU time for 100k DOF is under 20ms, you've won!</li>
           <li>Take a screenshot or copy the results</li>
           <li>Create a Pull Request with your optimizations</li>
           <li>Include your benchmark results and hardware specs</li>
